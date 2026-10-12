@@ -1,0 +1,7 @@
+auth.json
+*.log
+__pycache__/
+.cache/
+.venv/
+.DS_Store
+*.db
