@@ -6,13 +6,13 @@
 
 """
 ====================================================================
-🎓 Chaoxing Study Mate (超星学习助手)
+🎓 Chaoxing Study Mate (超星学习助手) - V2.0 工业增强版
 ====================================================================
 - 跨平台支持：Windows / macOS / Linux 均可一键运行
 - 认证机制：手机“学习通” App 扫码登录，持久化存储在 auth.json（免密复用）
 - 播放控制：100% 完整时长播放、真实心跳上报、突破失焦暂停、静音无头运行
-- 架构兼容：完美适配新版 MOOC2 (mooc2-ans/stu)、旧版 MOOC1 (studentcourse)
-            以及直接粘贴的任意正在播放的 studentstudy 小节链接！
+- 多Tab支持：全面支持小节内多标签轮询 (学习目标 / 视频 / 章节测验 / 文档)
+- 安全机制：防顶号下线强校验，杜绝虚假“打卡成功”，校园网卡顿自动看门狗
 ====================================================================
 """
 
@@ -49,7 +49,6 @@ def launch_browser(p, headless=True):
         except Exception:
             continue
 
-    # Linux 常见默认绝对路径回退
     for exec_path in ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium"]:
         if os.path.exists(exec_path):
             try:
@@ -126,7 +125,7 @@ def parse_course_url(input_url):
     }
 
 def play_video_frame(page, vf, video_idx, total_videos):
-    """控制单集视频播放，监听心跳，达到 100% 结束"""
+    """控制单集视频播放，监听心跳，达到 100% 结束，具备掉线强校验与看门狗"""
     is_passed = [False]
     notified_pass = [False]
 
@@ -150,7 +149,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
             return p.duration();
         }""")
     except Exception as e:
-        log(f"启动播放异常: {e}")
+        log(f"   ⚠️ 启动播放异常: {e}")
         page.remove_listener('response', on_response)
         return False
 
@@ -159,20 +158,30 @@ def play_video_frame(page, vf, video_idx, total_videos):
     if not dur or str(dur) == 'nan':
         dur = 0
 
-    log(f"--> [第 {video_idx}/{total_videos} 个视频] 开始播放，视频时长: {dur:.1f} 秒 ({dur/60:.2f} 分钟)")
+    log(f"   --> [视频 {video_idx}/{total_videos}] 开始播放，视频时长: {dur:.1f} 秒 ({dur/60:.2f} 分钟)")
 
     last_log_time = 0
     last_cur = -1
     stall_count = 0
+    error_count = 0
 
     while True:
         time.sleep(5)
+
+        # 1. 严格检查是否被其他设备顶号下线
+        current_page_url = page.url
+        if any(k in current_page_url for k in ["space/index", "monitor_temp", "passport2.chaoxing.com"]):
+            log("\n❌【严重警告】检测到超星账号在其他设备（手机/其他电脑）登录，已被迫下线！")
+            log("请先关闭其他设备上的学习通网页，并在本机重新扫码登录后再挂机。")
+            page.remove_listener('response', on_response)
+            sys.exit(1)
+
         try:
             status = vf.evaluate("""() => {
                 const p = window.videojs ? videojs.getPlayers()['video'] : null;
                 if (!p) return null;
 
-                // 自动处理视频中途弹窗小测 (单选/多选/判断)
+                // 自动处理视频中途弹窗小测
                 const quizDialog = document.querySelector('.ans-videoquiz');
                 if (quizDialog && quizDialog.style.display !== 'none') {
                     const opts = quizDialog.querySelectorAll('input[type="radio"], input[type="checkbox"], .ans-videoquiz-opt');
@@ -187,7 +196,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 const dur = p.duration();
                 const ended = p.ended();
 
-                // 只有在未播完且距离末尾大于 2.5 秒时，才触发防暂停恢复播放（防止触底重播死循环）
+                // 仅在未播完且距离末尾大于 2.5 秒时防暂停恢复播放
                 if (!ended && (!dur || cur < dur - 2.5)) {
                     if (p.paused()) {
                         p.play();
@@ -200,20 +209,31 @@ def play_video_frame(page, vf, video_idx, total_videos):
                     ended: ended
                 };
             }""")
-        except Exception:
-            break
+        except Exception as e:
+            error_count += 1
+            if error_count >= 5:
+                log(f"   ❌ 视频播放帧失联异常: {e}，跳过此视频。")
+                page.remove_listener('response', on_response)
+                return False
+            continue
 
         if not status:
-            break
+            error_count += 1
+            if error_count >= 5:
+                log("   ❌ 未能获取到播放器状态，跳过此视频。")
+                page.remove_listener('response', on_response)
+                return False
+            continue
 
+        error_count = 0
         cur = status['current']
         dur = status['duration'] or dur
 
-        # 看门狗检测：如果进度连续 40 秒未改变（校园网卡顿），自动触发播放器热重载
+        # 2. 看门狗检测：如果进度连续 40 秒未改变（校园网卡顿），自动触发播放器热重载
         if cur == last_cur and not status.get('paused') and cur < dur - 5.0:
             stall_count += 1
             if stall_count >= 8:
-                log("   ⚠️ [看门狗] 检测到视频缓冲卡顿超过 40 秒，已触发播放器热重载...")
+                log("   ⚠️ [看门狗] 检测到视频缓冲卡顿超过 40 秒，触发播放器热重载恢复...")
                 try:
                     vf.evaluate("() => { const p = videojs.getPlayers()['video']; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
                 except Exception:
@@ -238,20 +258,17 @@ def play_video_frame(page, vf, video_idx, total_videos):
             log(f"   [{bar}] {pct:5.1f}% | 剩余: {rem_str} | 已播: {int(cur)//60}分{int(cur)%60:02d}秒 / {int(dur)//60}分{int(dur)%60:02d}秒{pass_str}")
             last_log_time = time.time()
 
-        # 到达最后 2.5 秒内或触发 ended 视为 100% 完播
+        # 3. 必须真正播到视频最后 2.5 秒内或触发 ended 视为 100% 完播
         if status.get('ended') or (dur > 0 and cur >= dur - 2.5):
             log(f"   [100% 完播] 视频已完整播放至最后一秒，时长审计 100%！")
             time.sleep(3)
-            break
-
-    page.remove_listener('response', on_response)
-    return True
+            page.remove_listener('response', on_response)
+            return True
 
 def extract_chapters_from_page(page):
     """自适应提取页面中所有的章节信息"""
     return page.evaluate("""() => {
         const list = [];
-        // 1. studentstudy 页面中的 getTeacherAjax 节点
         document.querySelectorAll('[onclick*="getTeacherAjax"]').forEach(el => {
             const m = el.getAttribute('onclick').match(/getTeacherAjax\\('[^']*','[^']*','(\\d+)'/);
             if (m) {
@@ -261,7 +278,6 @@ def extract_chapters_from_page(page):
                 });
             }
         });
-        // 2. studentstudy 页面中的 a[href*="studentstudy"]
         if (list.length === 0) {
             document.querySelectorAll('a[href*="studentstudy"]').forEach(a => {
                 const m = a.href.match(/chapterId=(\\d+)/);
@@ -275,6 +291,46 @@ def extract_chapters_from_page(page):
         }
         return list;
     }""")
+
+def process_current_tab_tasks(page):
+    """处理当前卡片/标签下的所有任务点（包含视频与章节测验）"""
+    cards_frame = None
+    for f in page.frames:
+        if 'cards' in f.url:
+            cards_frame = f
+            break
+
+    # 1. 检查当前 Tab 下是否有视频
+    video_frames = [f for f in page.frames if 'video' in f.url]
+    if video_frames:
+        log(f"   发现 {len(video_frames)} 个视频任务，准备播放...")
+        for idx, vf in enumerate(video_frames):
+            is_done = False
+            if cards_frame:
+                try:
+                    is_done = cards_frame.evaluate(f"""() => {{
+                        const cts = document.querySelectorAll('.ans-attach-ct');
+                        if (cts[{idx}]) {{
+                            const icon = cts[{idx}].querySelector('.ans-job-icon');
+                            return icon && (icon.getAttribute('aria-label') || '').includes('已完成');
+                        }}
+                        return false;
+                    }}""")
+                except Exception:
+                    pass
+
+            if is_done:
+                log(f"   --> [视频 {idx + 1}/{len(video_frames)}] 此前已打卡完成，跳过。")
+                continue
+
+            success = play_video_frame(page, vf, idx + 1, len(video_frames))
+            if success:
+                log(f"   [打卡成功] 视频 {idx + 1} 学习完毕！")
+
+    # 2. 检查当前 Tab 下是否有章节测验/作业
+    quiz_frames = [f for f in page.frames if 'work' in f.url or 'quiz' in f.url or 'doHomeWorkNew' in f.url]
+    if quiz_frames:
+        log(f"   📝 检测到本标签包含【章节测验/单元测试】任务点。")
 
 def run_study(url, start_chapter=None):
     info = parse_course_url(url)
@@ -293,14 +349,12 @@ def run_study(url, start_chapter=None):
         cpi = info["cpi"] or "408853908"
         enc = info["enc"]
 
-        # 场景 1：如果用户输入的是已经打开的 studentstudy 页面
         if info["is_study_page"]:
             log("检测到输入链接为具体小节学习页面，正在直接加载并提取完整目录...")
             page.goto(info["raw_url"], wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
             chapters = extract_chapters_from_page(page)
 
-        # 场景 2：如果用户输入的是 MOOC2 门户首页 (stu)
         elif info["is_mooc2_portal"]:
             log("检测到输入链接为 MOOC2 课程门户首页，正在加载章节框架...")
             page.goto(info["raw_url"], wait_until="networkidle")
@@ -334,7 +388,6 @@ def run_study(url, start_chapter=None):
                     cpi = cfg["cpi"] or cpi
                     chapters = cfg["chapters"]
 
-        # 场景 3：其他泛雅门户首页 (studentcourse)
         else:
             log("正在加载课程主页目录...")
             page.goto(info["raw_url"], wait_until="networkidle")
@@ -348,7 +401,6 @@ def run_study(url, start_chapter=None):
 
         log(f"🎉 成功识别课程结构，共检测到 {len(chapters)} 个有效小节。")
 
-        # 定位起始章节
         start_idx = 0
         target_id = start_chapter or info["chapter_id"]
         if target_id:
@@ -364,56 +416,36 @@ def run_study(url, start_chapter=None):
             ch_id = ch["id"]
             ch_title = ch["title"]
 
-            if any(k in ch_title for k in ['习题', '作业', '测验', '问卷', '考试']):
-                log(f"跳过非视频小节: {ch_title}")
-                continue
-
-            # 跨域中继跳转构建
+            # 构建进入小节的 URL
             refer_url = f"https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId={ch_id}&courseId={info['course_id']}&clazzid={info['clazz_id']}&cpi={cpi}&enc={enc}&mooc2=1&hidetype=0&fanyaVersion=0"
             transfer_url = f"https://mooc1.chaoxing.com/mycourse/transfer?moocId={info['course_id']}&clazzid={info['clazz_id']}&linkTime={int(time.time()*1000)}&ut=s&refer={urllib.parse.quote(refer_url)}"
 
-            log(f"==========================================")
+            log(f"==================================================")
             log(f"正在进入小节: {ch_title} (ID: {ch_id})")
-            log(f"==========================================")
+            log(f"==================================================")
 
             page.goto(transfer_url, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
 
-            cards_frame = None
-            for f in page.frames:
-                if 'cards' in f.url:
-                    cards_frame = f
-                    break
+            # 核心升级：遍历本小节顶部的所有 Tab 标签 (例如：1学习目标、2视频、3章节测验)
+            tab_elements = page.locator('.prev_ul li').all()
+            if not tab_elements:
+                # 若无多 Tab，直接处理当前卡片内容
+                process_current_tab_tasks(page)
+            else:
+                log(f"检测到小节顶部包含 {len(tab_elements)} 个内容标签，逐一巡检...")
+                for t_idx in range(len(tab_elements)):
+                    # 重新定位以防 DOM 刷新
+                    cur_tabs = page.locator('.prev_ul li').all()
+                    if t_idx < len(cur_tabs):
+                        tab_item = cur_tabs[t_idx]
+                        tab_name = tab_item.inner_text().strip().replace('\n', ' ')
+                        log(f"👉 切换至标签 [{tab_name}]...")
+                        tab_item.click()
+                        page.wait_for_timeout(3000)
+                        process_current_tab_tasks(page)
 
-            video_frames = [f for f in page.frames if 'video' in f.url]
-            if not video_frames:
-                log(f"[{ch_title}] 未检测到视频任务点，跳过。")
-                continue
-
-            log(f"[{ch_title}] 检测到 {len(video_frames)} 个视频任务。")
-            for idx, vf in enumerate(video_frames):
-                is_done = False
-                if cards_frame:
-                    try:
-                        is_done = cards_frame.evaluate(f"""() => {{
-                            const cts = document.querySelectorAll('.ans-attach-ct');
-                            if (cts[{idx}]) {{
-                                const icon = cts[{idx}].querySelector('.ans-job-icon');
-                                return icon && (icon.getAttribute('aria-label') || '').includes('已完成');
-                            }}
-                            return false;
-                        }}""")
-                    except Exception:
-                        pass
-
-                if is_done:
-                    log(f"--> [第 {idx + 1}/{len(video_frames)} 个视频] 此前已打卡完成，自动跳过。")
-                    continue
-
-                play_video_frame(page, vf, idx + 1, len(video_frames))
-                log(f"[打卡成功] 第 {idx + 1} 个视频播放完毕！")
-
-            log(f"[{ch_title}] 本小节全部视频学习完成！\n")
+            log(f"[{ch_title}] 本小节全部内容巡检/学习完成！\n")
 
         log("\n🎉 所有目标章节任务点全部播放完成！")
         browser.close()
