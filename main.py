@@ -260,12 +260,16 @@ def play_video_frame(page, vf, video_idx, total_videos):
             log(f"   [状态更新] 任务点已达标(isPassed=true)，继续播完至 100% 结束以确保数据审计完整...")
             notified_pass[0] = True
 
-        if time.time() - last_log_time >= 30:
+        if time.time() - last_log_time >= 25:
             pct = (cur / dur * 100) if dur > 0 else 0
-            pass_str = " [任务点已通过]" if is_passed[0] else ""
-            log(f"   [播放中] 进度: {cur:.1f}s / {dur:.1f}s ({pct:.1f}%){pass_str}")
+            rem_sec = max(0, int(dur - cur))
+            rem_str = f"{rem_sec // 60}分{rem_sec % 60:02d}秒"
+            bar_len = 18
+            filled = int(bar_len * (pct / 100))
+            bar = "█" * filled + "░" * (bar_len - filled)
+            pass_str = " [已通关]" if is_passed[0] else ""
+            log(f"   [{bar}] {pct:5.1f}% | 剩余: {rem_str} | 已播: {int(cur)//60}分{int(cur)%60:02d}秒 / {int(dur)//60}分{int(dur)%60:02d}秒{pass_str}")
             last_log_time = time.time()
-
         # 到达最后 2.5 秒内或触发 ended 视为 100% 完播
         if status.get('ended') or (dur > 0 and cur >= dur - 2.5):
             log(f"   [100% 完播] 视频已完整播放至最后一秒，时长审计 100%！")
