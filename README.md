@@ -38,12 +38,11 @@
 打开终端执行以下命令：
 
 ```bash
-git clone https://github.com/<your-username>/cx-study-mate.git
+git clone https://github.com/luckjokerwang/cx-study-mate.git
 cd cx-study-mate
 chmod +x start.sh
 ./start.sh
 ```
-
 ---
 
 ## 💻 进阶命令行运行 (CLI)
