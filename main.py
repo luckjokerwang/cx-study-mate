@@ -194,6 +194,9 @@ def play_video_frame(page, vf, video_idx, total_videos):
     log(f"--> [第 {video_idx}/{total_videos} 个视频] 开始播放，视频时长: {dur:.1f} 秒 ({dur/60:.2f} 分钟)")
 
     last_log_time = 0
+    last_cur = -1
+    stall_count = 0
+
     while True:
         time.sleep(5)
         try:
@@ -201,11 +204,14 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 const p = window.videojs ? videojs.getPlayers()['video'] : null;
                 if (!p) return null;
 
-                // 自动处理视频中途弹窗小测
+                // 自动处理视频中途弹窗小测 (单选/多选/判断)
                 const quizDialog = document.querySelector('.ans-videoquiz');
                 if (quizDialog && quizDialog.style.display !== 'none') {
-                    const firstOpt = quizDialog.querySelector('input[type="radio"], input[type="checkbox"], .ans-videoquiz-opt');
-                    if (firstOpt) firstOpt.click();
+                    const opts = quizDialog.querySelectorAll('input[type="radio"], input[type="checkbox"], .ans-videoquiz-opt');
+                    if (opts.length > 0) {
+                        // 随机或默认选第一个
+                        opts[0].click();
+                    }
                     const submitBtn = quizDialog.querySelector('.ans-videoquiz-submit, .btnSubmit, button');
                     if (submitBtn) submitBtn.click();
                 }
@@ -235,6 +241,20 @@ def play_video_frame(page, vf, video_idx, total_videos):
 
         cur = status['current']
         dur = status['duration'] or dur
+
+        # 看门狗检测：如果进度连续 40 秒未改变（校园网卡顿），自动触发缓冲重启
+        if cur == last_cur and not status.get('paused') and cur < dur - 5.0:
+            stall_count += 1
+            if stall_count >= 8: # 8 * 5s = 40s
+                log("   ⚠️ [看门狗] 检测到视频缓冲卡顿超过 40 秒，已触发播放器热重载...")
+                try:
+                    vf.evaluate("() => { const p = videojs.getPlayers()['video']; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
+                except Exception:
+                    pass
+                stall_count = 0
+        else:
+            stall_count = 0
+        last_cur = cur
 
         if is_passed[0] and not notified_pass[0]:
             log(f"   [状态更新] 任务点已达标(isPassed=true)，继续播完至 100% 结束以确保数据审计完整...")
@@ -364,7 +384,10 @@ def main():
         print("未输入有效链接，程序退出。")
         sys.exit(0)
 
-    run_study(course_url, args.start)
-
+    try:
+        run_study(course_url, args.start)
+    except KeyboardInterrupt:
+        print("\n\n🛑 [用户已按 Ctrl+C 中断] 已安全退出，此前已播放完成的进度已全部保存在超星服务器。")
+        sys.exit(0)
 if __name__ == "__main__":
     main()
