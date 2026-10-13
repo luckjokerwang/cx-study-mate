@@ -313,8 +313,41 @@ def hash_glyph(glyph):
         last_index = end_point + 1
     return hashlib.md5(''.join(pos_data).encode()).hexdigest()
 
-def solve_quiz_with_ai(work_frame, ai_cfg):
-    """解密字体、大模型辅助答题并自动点击【暂存草稿】"""
+def clean_question_text(q):
+    q = re.sub(r'^[0-9]+[、. ]*', '', q)
+    q = re.sub(r'【.*?】', '', q)
+    q = re.sub(r'\(.*?\)|（.*?）', '', q)
+    q = re.sub(r'[。？！\s]+$', '', q)
+    return q.strip()
+
+def query_public_tiku(question):
+    """请求去商业化的公开免费题库接口"""
+    cq = clean_question_text(question)
+    url = "http://cx.icodef.com/wyn-nb?v=4"
+    data = json.dumps({"question": cq}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "X-Forwarded-For": "114.114.114.114"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("code") == 1:
+                ans = str(res.get("data", "")).strip()
+                # 过滤第三方广告
+                if not any(k in ans for k in ["叛逆", "公众号", "李恒雅", "一之", "付费", "扫码"]):
+                    return ans
+    except Exception:
+        pass
+    return None
+
+def solve_quiz(work_frame, mode="tiku", ai_cfg=None):
+    """解密字体、查题/AI辅助答题并自动点击【暂存草稿】"""
     from fontTools.ttLib.ttFont import TTFont
 
     if not os.path.exists(FONT_MAP_FILE):
@@ -361,60 +394,71 @@ def solve_quiz_with_ai(work_frame, ai_cfg):
         return ''.join(res).translate(KX_RADICALS_TAB)
 
     timus = work_frame.locator('.TiMu').all()
-    log(f"   📝 检测到测验包含 {len(timus)} 道题，正在调用 AI 模型解答...")
+    log(f"   📝 检测到测验包含 {len(timus)} 道题，正在进行智能匹配解答 (模式: {mode})...")
 
+    matched_count = 0
     for idx, timu in enumerate(timus):
-        raw_txt = decode_text(timu.inner_text()).strip()
+        raw_title = timu.locator('.Zy_TItle .clearfix').inner_text()
+        title = decode_text(raw_title).strip()
         opts = timu.locator('ul li').all()
-        opt_texts = []
-        for o in opts:
-            span = o.locator('.num_option, .num_option_dx')
-            d = span.get_attribute('data') if span.count() > 0 else '?'
-            opt_texts.append(f"{d}. {decode_text(o.inner_text()).strip()}")
 
-        prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项字母（如 A 或 true 或 ABC）：\n题目：{raw_txt}\n选项：\n" + "\n".join(opt_texts)
+        answer_str = None
+        # 1. 优先尝试公共题库
+        if mode == "tiku":
+            answer_str = query_public_tiku(title)
+            if answer_str:
+                log(f"      [题 {idx+1}] 题库命中标准答案: {answer_str}")
+            else:
+                log(f"      [题 {idx+1}] 题库未收录，保留空白供人工复核。")
 
-        # 调 OpenAI 兼容接口
-        api_key = ai_cfg.get("api_key")
-        base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
-        model = ai_cfg.get("model", "deepseek-chat")
-
-        answer_str = "A" # 兜底
-        if api_key:
-            try:
-                req_data = json.dumps({
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1
-                }).encode("utf-8")
-                req = urllib.request.Request(
-                    f"{base_url}/chat/completions",
-                    data=req_data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}"
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    answer_str = resp_json["choices"][0]["message"]["content"].strip().upper()
-            except Exception as e:
-                log(f"   ⚠️ AI 答题请求失败 ({e})，将使用默认选项暂存。")
-
-        # 勾选答案
-        for o in opts:
-            span = o.locator('.num_option, .num_option_dx')
-            d = (span.get_attribute('data') or '').upper()
-            if d and (d in answer_str or ('对' in answer_str and d == 'TRUE') or ('错' in answer_str and d == 'FALSE')):
+        # 2. 如果是 AI 模式或题库未命中且配置了 AI
+        if not answer_str and (mode == "ai" or (ai_cfg and ai_cfg.get("api_key"))):
+            opt_texts = [f"{o.locator('.num_option, .num_option_dx').inner_text().strip()}. {decode_text(o.inner_text()).strip()}" for o in opts]
+            prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项内容或字母（如 A 或 错误 或 A,B）：\n题目：{title}\n选项：\n" + "\n".join(opt_texts)
+            api_key = (ai_cfg or {}).get("api_key")
+            base_url = (ai_cfg or {}).get("base_url", "https://api.deepseek.com/v1").rstrip("/")
+            model = (ai_cfg or {}).get("model", "deepseek-chat")
+            if api_key:
                 try:
-                    o.click()
-                except Exception:
-                    pass
+                    req_data = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}).encode("utf-8")
+                    req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        answer_str = res["choices"][0]["message"]["content"].strip()
+                        log(f"      [题 {idx+1}] AI 解答: {answer_str}")
+                except Exception as e:
+                    log(f"      [题 {idx+1}] AI 请求失败: {e}")
+
+        if not answer_str:
+            continue
+
+        matched_count += 1
+        # 判断题匹配
+        if re.search(r'(错误|错|false|否|×)', answer_str, re.I):
+            try:
+                timu.locator('.num_option[data="false"], input[value="false"]').first.click()
+            except Exception: pass
+        elif re.search(r'(正确|对|true|是|√)', answer_str, re.I):
+            try:
+                timu.locator('.num_option[data="true"], input[value="true"]').first.click()
+            except Exception: pass
+        else:
+            # 文本比对匹配
+            ans_parts = [a.strip() for a in re.split(r'[#;,/ ]', answer_str) if a.strip()]
+            for o in opts:
+                opt_txt = decode_text(o.inner_text()).strip()
+                span = o.locator('.num_option, .num_option_dx')
+                opt_key = (span.inner_text().strip() if span.count() > 0 else '').upper()
+                for ans_item in ans_parts:
+                    if (ans_item == opt_txt) or (len(ans_item) > 1 and ans_item in opt_txt) or (opt_key and opt_key == ans_item.upper()):
+                        try:
+                            o.click()
+                        except Exception: pass
 
     # 核心安全操作：只点击“暂存”，绝不自动提交！
     time.sleep(1)
     work_frame.evaluate("() => { if (window.noSubmit) window.noSubmit(); }")
-    log("   ✅【测验草稿暂存完成】所有题目已写入并自动暂存！请在网页端核对后手动提交。")
+    log(f"   ✅【测验草稿暂存完成】已成功填涂 {matched_count}/{len(timus)} 题并暂存草稿！请在网页端核对后手动提交。")
 
 def extract_chapters_from_page(page):
     """自适应提取页面中所有的章节信息"""
@@ -482,8 +526,8 @@ def process_current_tab_tasks(page, cfg):
     quiz_frames = [f for f in page.frames if 'doHomeWorkNew' in f.url]
     if quiz_frames:
         q_mode = cfg.get("quiz_mode", "skip")
-        if q_mode == "ai":
-            solve_quiz_with_ai(quiz_frames[0], cfg.get("ai_config", {}))
+        if q_mode in ["tiku", "ai"]:
+            solve_quiz(quiz_frames[0], mode=q_mode, ai_cfg=cfg.get("ai_config", {}))
         else:
             log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
@@ -629,14 +673,18 @@ def main():
     if not args.quiz_mode:
         saved_mode = cfg.get("quiz_mode", "skip")
         print("\n2. 请选择单元测试/章节测验处理方式:")
-        print("   [1] 仅看视频，安全跳过测验（默认推荐，最稳妥）")
-        print("   [2] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
-        choice = input(f"请输入选项 [1/2] (直接回车默认 [{'1' if saved_mode=='skip' else '2'}]): ").strip()
+        print("   [1] 仅看视频，安全跳过测验（默认最稳妥）")
+        print("   [2] 公共题库自动答题并【自动暂存草稿】（推荐，零门槛免配置开箱即用）")
+        print("   [3] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
+        default_disp = '1' if saved_mode == 'skip' else ('2' if saved_mode == 'tiku' else '3')
+        choice = input(f"请输入选项 [1/2/3] (直接回车默认 [{default_disp}]): ").strip()
 
         if choice == "2":
+            cfg["quiz_mode"] = "tiku"
+        elif choice == "3":
             cfg["quiz_mode"] = "ai"
             if not cfg["ai_config"].get("api_key"):
-                user_key = input("请输入你的 AI API Key (支持 DeepSeek / 硅基流动 / Qwen，直接回车可稍后填): ").strip()
+                user_key = input("请输入你的 AI API Key (直接回车可稍后填): ").strip()
                 if user_key:
                     cfg["ai_config"]["api_key"] = user_key
         elif choice == "1":
