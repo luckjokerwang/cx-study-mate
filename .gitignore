@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 .DS_Store
 *.db
+course_cache.json

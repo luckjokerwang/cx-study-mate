@@ -36,8 +36,8 @@ from playwright.sync_api import sync_playwright
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
 FONT_MAP_FILE = os.path.join(BASE_DIR, "font_map_table.json")
-
 KX_RADICALS_TAB = str.maketrans(
     '⼀⼁⼂⼃⼄⼅⼆⼇⼈⼉⼊⼋⼌⼍⼎⼏⼐⼑⼒⼓⼔⼕⼖⼗⼘⼙⼚⼛⼜⼝⼞⼟⼠⼡⼢⼣⼤⼥⼦⼧⼨⼩⼪⼫⼬⼭⼮⼯⼰⼱⼲⼳⼴⼵⼶⼷⼸⼹⼺⼻⼼⼽⼾⼿⽀⽁⽂⽃⽄⽅⽆⽇⽈⽉⽊⽋⽌⽍⽎⽏⽐⽑⽒⽓⽔⽕⽖⽗⽘⽙⽚⽛⽜⽝⽞⽟⽠⽡⽢⽣⽤⽥⽦⽧⽨⽩⽪⽫⽬⽭⽮⽯⽰⽱⽲⽳⽴⽵⽶⽷⽸⽹⽺⽻⽼⽽⽾⽿⾀⾁⾂⾃⾄⾅⾆⾇⾈⾉⾊⾋⾌⾍⾎⾏⾐⾑⾒⾓⾔⾕⾖⾗⾘⾙⾚⾛⾜⾝⾞⾟⾠⾡⾢⾣⾤⾥⾦⾧⾨⾩⾪⾫⾬⾭⾮⾯⾰⾱⾲⾳⾴⾵⾶⾷⾸⾹⾺⾻⾼髙⾽⾾⾿⿀⿁⿂⿃⿄⿅⿆⿇⿈⿉⿊⿋⿌⿍⿎⿏⿐⿑⿒⿓⿔⿕⺠⻬⻩⻢⻜⻅⺟⻓',
     '一丨丶丿乙亅二亠人儿入八冂冖冫几凵刀力勹匕匚匸十卜卩厂厶又口囗土士夂夊夕大女子宀寸小尢尸屮山巛工己巾干幺广廴廾弋弓彐彡彳心戈戶手支攴文斗斤方无日曰月木欠止歹殳毋比毛氏气水火爪父爻爿片牙牛犬玄玉瓜瓦甘生用田疋疒癶白皮皿目矛矢石示禸禾穴立竹米糸缶网羊羽老而耒耳聿肉臣自至臼舌舛舟艮色艸虍虫血行衣襾見角言谷豆豕豸貝赤走足身車辛辰辵邑酉采里金長門阜隶隹雨青非面革韋韭音頁風飞食首香馬骨高高髟鬥鬯鬲鬼魚鳥鹵鹿麥麻黃黍黑黹黽鼎鼓鼠鼻齊齒龍龜龠民齐黄马飞见母长'
@@ -70,6 +70,24 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+def load_course_cache():
+    """加载上次未完成的课程状态与断点"""
+    if os.path.exists(COURSE_CACHE_FILE):
+        try:
+            with open(COURSE_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def save_course_cache(cache_data):
+    """持久化保存当前课程进度"""
+    try:
+        with open(COURSE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 def launch_browser(p, headless=True):
     """跨平台智能探测并唤起本地已有的 Chrome 或 Edge"""
@@ -601,20 +619,38 @@ def run_study(url, start_chapter=None, cfg=None):
             browser.close()
             return
 
-        log(f"🎉 成功识别课程结构，共检测到 {len(chapters)} 个有效小节。")
+        raw_title = page.title()
+        course_name = raw_title.replace("学生学习页面", "").replace("课程门户", "").replace("首页", "").strip() or f"课程_{info['course_id']}"
+        log(f"🎉 成功识别课程《{course_name}》，共检测到 {len(chapters)} 个有效小节。")
 
         start_idx = 0
         target_id = start_chapter or info["chapter_id"]
         if target_id:
-            for idx, c in enumerate(chapters):
-                if target_id in c["title"] or target_id == c["id"]:
-                    start_idx = idx
-                    break
+            try:
+                num_idx = int(target_id)
+                if 0 <= num_idx < len(chapters):
+                    start_idx = num_idx
+                elif 1 <= num_idx <= len(chapters):
+                    start_idx = num_idx - 1
+            except ValueError:
+                for idx, c in enumerate(chapters):
+                    if target_id in c["title"] or target_id == c["id"]:
+                        start_idx = idx
+                        break
+        else:
+            # 自动查询本地断点进度
+            c_cache = load_course_cache()
+            if c_cache and c_cache.get("course_id") == info["course_id"] and not c_cache.get("is_finished"):
+                cached_idx = c_cache.get("last_chapter_index", 0)
+                if 0 <= cached_idx < len(chapters):
+                    start_idx = cached_idx
+                    log(f"📌 自动恢复本地断点进度: 跳过前 {start_idx} 节，直达第 {start_idx + 1} 节继续！")
 
         target_chapters = chapters[start_idx:]
         log(f"从第 {start_idx + 1} 节 [{target_chapters[0]['title']}] 开始，后续共 {len(target_chapters)} 个小节。\n")
 
-        for ch in target_chapters:
+        for offset, ch in enumerate(target_chapters):
+            current_abs_idx = start_idx + offset
             ch_id = ch["id"]
             ch_title = ch["title"]
 
@@ -622,7 +658,7 @@ def run_study(url, start_chapter=None, cfg=None):
             transfer_url = f"https://mooc1.chaoxing.com/mycourse/transfer?moocId={info['course_id']}&clazzid={info['clazz_id']}&linkTime={int(time.time()*1000)}&ut=s&refer={urllib.parse.quote(refer_url)}"
 
             log(f"==================================================")
-            log(f"正在进入小节: {ch_title} (ID: {ch_id})")
+            log(f"正在进入小节 [{current_abs_idx + 1}/{len(chapters)}]: {ch_title} (ID: {ch_id})")
             log(f"==================================================")
 
             page.goto(transfer_url, wait_until="domcontentloaded")
@@ -646,7 +682,32 @@ def run_study(url, start_chapter=None, cfg=None):
 
             log(f"[{ch_title}] 本小节全部内容巡检/学习完成！\n")
 
+            # 实时更新保存本地断点缓存
+            save_course_cache({
+                "url": url,
+                "course_id": info["course_id"],
+                "course_name": course_name,
+                "total_chapters": len(chapters),
+                "last_chapter_id": ch_id,
+                "last_chapter_title": ch_title,
+                "last_chapter_index": current_abs_idx + 1,
+                "is_finished": False,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+
         log("\n🎉 所有目标章节任务点全部播放完成！")
+        # 完结标记
+        save_course_cache({
+            "url": url,
+            "course_id": info["course_id"],
+            "course_name": course_name,
+            "total_chapters": len(chapters),
+            "last_chapter_id": target_chapters[-1]["id"] if target_chapters else "",
+            "last_chapter_title": target_chapters[-1]["title"] if target_chapters else "",
+            "last_chapter_index": len(chapters),
+            "is_finished": True,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
         browser.close()
 
 def main():
@@ -657,13 +718,35 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config()
+    cached = load_course_cache()
+    has_unfinished = cached and not cached.get("is_finished") and cached.get("url")
 
     course_url = args.url
     if not course_url:
         print("\n" + "=" * 55)
-        print("🎓 欢迎使用 Chaoxing Study Mate 超星学习助手 (V2.5)")
+        print("🎓 欢迎使用 Chaoxing Study Mate 超星学习助手 (V2.6)")
         print("=" * 55)
-        course_url = input("1. 请输入你的超星课程链接 (直接复制浏览器地址栏): ").strip()
+
+        if has_unfinished:
+            c_name = cached.get('course_name') or '未命名课程'
+            c_idx = cached.get('last_chapter_index', 1)
+            c_tot = cached.get('total_chapters', '?')
+            c_title = cached.get('last_chapter_title', '')
+            c_time = cached.get('updated_at', '')
+            print("📌 检测到上次未完成的课程记录:")
+            print(f"   - 课程名称: 《{c_name}》 (ID: {cached.get('course_id')})")
+            print(f"   - 上次进度: 第 {c_idx}/{c_tot} 节 [{c_title}]")
+            print(f"   - 记录时间: {c_time}")
+            prompt_str = "\n1. 直接按 [回车] 继续上次进度，或输入新的课程链接: "
+        else:
+            prompt_str = "1. 请输入你的超星课程链接 (直接复制浏览器地址栏): "
+
+        user_input = input(prompt_str).strip()
+        if not user_input and has_unfinished:
+            course_url = cached["url"]
+            print(f"⚡ 已自动选择继续上次进度，直达第 {cached.get('last_chapter_index', 1)} 节！")
+        else:
+            course_url = user_input
 
     if not course_url:
         print("未输入有效链接，程序退出。")
