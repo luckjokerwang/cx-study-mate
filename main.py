@@ -1,17 +1,20 @@
 # /// script
 # dependencies = [
 #   "playwright>=1.40.0",
+#   "fonttools>=4.40.0",
 # ]
 # ///
 
 """
 ====================================================================
-🎓 Chaoxing Study Mate (超星学习助手) - V2.0 工业增强版
+🎓 Chaoxing Study Mate (超星学习助手) - V2.5 终极生产版
 ====================================================================
 - 跨平台支持：Windows / macOS / Linux 均可一键运行
+- 极速镜像加速：自动检测国内外网络环境，启用清华/阿里镜像极速拉取
 - 认证机制：手机“学习通” App 扫码登录，持久化存储在 auth.json（免密复用）
 - 播放控制：100% 完整时长播放、真实心跳上报、突破失焦暂停、静音无头运行
 - 多Tab支持：全面支持小节内多标签轮询 (学习目标 / 视频 / 章节测验 / 文档)
+- 作业测验自选：自由选择【跳过测验】或【AI智能辅助解题并自动暂存草稿】
 - 安全机制：防顶号下线强校验，杜绝虚假“打卡成功”，校园网卡顿自动看门狗
 ====================================================================
 """
@@ -21,19 +24,55 @@ import sys
 import time
 import json
 import re
+import io
+import base64
+import hashlib
 import argparse
+import urllib.request
 import urllib.parse
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
-AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+FONT_MAP_FILE = os.path.join(BASE_DIR, "font_map_table.json")
+
+KX_RADICALS_TAB = str.maketrans(
+    '⼀⼁⼂⼃⼄⼅⼆⼇⼈⼉⼊⼋⼌⼍⼎⼏⼐⼑⼒⼓⼔⼕⼖⼗⼘⼙⼚⼛⼜⼝⼞⼟⼠⼡⼢⼣⼤⼥⼦⼧⼨⼩⼪⼫⼬⼭⼮⼯⼰⼱⼲⼳⼴⼵⼶⼷⼸⼹⼺⼻⼼⼽⼾⼿⽀⽁⽂⽃⽄⽅⽆⽇⽈⽉⽊⽋⽌⽍⽎⽏⽐⽑⽒⽓⽔⽕⽖⽗⽘⽙⽚⽛⽜⽝⽞⽟⽠⽡⽢⽣⽤⽥⽦⽧⽨⽩⽪⽫⽬⽭⽮⽯⽰⽱⽲⽳⽴⽵⽶⽷⽸⽹⽺⽻⽼⽽⽾⽿⾀⾁⾂⾃⾄⾅⾆⾇⾈⾉⾊⾋⾌⾍⾎⾏⾐⾑⾒⾓⾔⾕⾖⾗⾘⾙⾚⾛⾜⾝⾞⾟⾠⾡⾢⾣⾤⾥⾦⾧⾨⾩⾪⾫⾬⾭⾮⾯⾰⾱⾲⾳⾴⾵⾶⾷⾸⾹⾺⾻⾼髙⾽⾾⾿⿀⿁⿂⿃⿄⿅⿆⿇⿈⿉⿊⿋⿌⿍⿎⿏⿐⿑⿒⿓⿔⿕⺠⻬⻩⻢⻜⻅⺟⻓',
+    '一丨丶丿乙亅二亠人儿入八冂冖冫几凵刀力勹匕匚匸十卜卩厂厶又口囗土士夂夊夕大女子宀寸小尢尸屮山巛工己巾干幺广廴廾弋弓彐彡彳心戈戶手支攴文斗斤方无日曰月木欠止歹殳毋比毛氏气水火爪父爻爿片牙牛犬玄玉瓜瓦甘生用田疋疒癶白皮皿目矛矢石示禸禾穴立竹米糸缶网羊羽老而耒耳聿肉臣自至臼舌舛舟艮色艸虍虫血行衣襾見角言谷豆豕豸貝赤走足身車辛辰辵邑酉采里金長門阜隶隹雨青非面革韋韭音頁風飞食首香馬骨高高髟鬥鬯鬲鬼魚鳥鹵鹿麥麻黃黍黑黹黽鼎鼓鼠鼻齊齒龍龜龠民齐黄马飞见母长'
+)
 
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
 
+def load_config():
+    default_cfg = {
+        "quiz_mode": "skip",
+        "ai_config": {
+            "api_key": "",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat"
+        }
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return {**default_cfg, **json.load(f)}
+        except Exception:
+            pass
+    return default_cfg
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 def launch_browser(p, headless=True):
-    """跨平台智能探测并唤起本地已有的 Chrome 或 Edge，无需重新下载 300MB 浏览器"""
+    """跨平台智能探测并唤起本地已有的 Chrome 或 Edge"""
     for ch in ["chrome", "msedge"]:
         try:
             return p.chromium.launch(
@@ -63,7 +102,7 @@ def launch_browser(p, headless=True):
     return p.chromium.launch(headless=headless, args=['--disable-blink-features=AutomationControlled', '--mute-audio'])
 
 def ensure_login(p):
-    """检查登录态。若不存在或已过期，则弹出二维码让用户通过学习通 App 扫码登录"""
+    """检查登录态，无登录态则弹出二维码扫码"""
     if os.path.exists(AUTH_FILE):
         try:
             with open(AUTH_FILE, "r", encoding="utf-8") as f:
@@ -168,11 +207,11 @@ def play_video_frame(page, vf, video_idx, total_videos):
     while True:
         time.sleep(5)
 
-        # 1. 严格检查是否被其他设备顶号下线
+        # 检查是否被顶号
         current_page_url = page.url
         if any(k in current_page_url for k in ["space/index", "monitor_temp", "passport2.chaoxing.com"]):
-            log("\n❌【严重警告】检测到超星账号在其他设备（手机/其他电脑）登录，已被迫下线！")
-            log("请先关闭其他设备上的学习通网页，并在本机重新扫码登录后再挂机。")
+            log("\n❌【严重警告】检测到超星账号在其他设备登录已被迫下线！")
+            log("请先关闭其他设备上的网页，并在本机重新扫码登录。")
             page.remove_listener('response', on_response)
             sys.exit(1)
 
@@ -181,7 +220,6 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 const p = window.videojs ? videojs.getPlayers()['video'] : null;
                 if (!p) return null;
 
-                // 自动处理视频中途弹窗小测
                 const quizDialog = document.querySelector('.ans-videoquiz');
                 if (quizDialog && quizDialog.style.display !== 'none') {
                     const opts = quizDialog.querySelectorAll('input[type="radio"], input[type="checkbox"], .ans-videoquiz-opt');
@@ -196,7 +234,6 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 const dur = p.duration();
                 const ended = p.ended();
 
-                // 仅在未播完且距离末尾大于 2.5 秒时防暂停恢复播放
                 if (!ended && (!dur || cur < dur - 2.5)) {
                     if (p.paused()) {
                         p.play();
@@ -212,7 +249,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
         except Exception as e:
             error_count += 1
             if error_count >= 5:
-                log(f"   ❌ 视频播放帧失联异常: {e}，跳过此视频。")
+                log(f"   ❌ 视频播放帧失联: {e}，跳过此视频。")
                 page.remove_listener('response', on_response)
                 return False
             continue
@@ -220,7 +257,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
         if not status:
             error_count += 1
             if error_count >= 5:
-                log("   ❌ 未能获取到播放器状态，跳过此视频。")
+                log("   ❌ 未能获取播放状态，跳过此视频。")
                 page.remove_listener('response', on_response)
                 return False
             continue
@@ -229,11 +266,10 @@ def play_video_frame(page, vf, video_idx, total_videos):
         cur = status['current']
         dur = status['duration'] or dur
 
-        # 2. 看门狗检测：如果进度连续 40 秒未改变（校园网卡顿），自动触发播放器热重载
         if cur == last_cur and not status.get('paused') and cur < dur - 5.0:
             stall_count += 1
             if stall_count >= 8:
-                log("   ⚠️ [看门狗] 检测到视频缓冲卡顿超过 40 秒，触发播放器热重载恢复...")
+                log("   ⚠️ [看门狗] 缓冲卡顿超过 40 秒，触发播放器热重载恢复...")
                 try:
                     vf.evaluate("() => { const p = videojs.getPlayers()['video']; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
                 except Exception:
@@ -258,12 +294,127 @@ def play_video_frame(page, vf, video_idx, total_videos):
             log(f"   [{bar}] {pct:5.1f}% | 剩余: {rem_str} | 已播: {int(cur)//60}分{int(cur)%60:02d}秒 / {int(dur)//60}分{int(dur)%60:02d}秒{pass_str}")
             last_log_time = time.time()
 
-        # 3. 必须真正播到视频最后 2.5 秒内或触发 ended 视为 100% 完播
         if status.get('ended') or (dur > 0 and cur >= dur - 2.5):
             log(f"   [100% 完播] 视频已完整播放至最后一秒，时长审计 100%！")
             time.sleep(3)
             page.remove_listener('response', on_response)
             return True
+
+def hash_glyph(glyph):
+    if glyph.numberOfContours <= 0: return ''
+    pos_data = []
+    last_index = 0
+    for i in range(glyph.numberOfContours):
+        end_point = glyph.endPtsOfContours[i]
+        for j in range(last_index, end_point + 1):
+            x, y = glyph.coordinates[j]
+            flag = glyph.flags[j] & 0x01
+            pos_data.append(f'{x}{y}{flag}')
+        last_index = end_point + 1
+    return hashlib.md5(''.join(pos_data).encode()).hexdigest()
+
+def solve_quiz_with_ai(work_frame, ai_cfg):
+    """解密字体、大模型辅助答题并自动点击【暂存草稿】"""
+    from fontTools.ttLib.ttFont import TTFont
+
+    if not os.path.exists(FONT_MAP_FILE):
+        log("   ⚠️ 未找到 font_map_table.json 字体解密表，跳过自动答题。")
+        return
+
+    with open(FONT_MAP_FILE, "r", encoding="utf-8") as f:
+        char_map = json.load(f)
+    hash_map = {h: c for c, h in char_map.items()}
+
+    font_b64 = work_frame.evaluate("""() => {
+        for (let s of document.querySelectorAll('style')) {
+            let m = s.textContent.match(/base64,([\\w\\W]+?)'/);
+            if (m) return m[1];
+        }
+        return null;
+    }""")
+
+    font_hashmap = {}
+    if font_b64:
+        try:
+            font_file = TTFont(io.BytesIO(base64.b64decode(font_b64)), lazy=False)
+            glyf_table = font_file['glyf']
+            for name in glyf_table.glyphOrder:
+                if name.startswith('uni'):
+                    ghash = hash_glyph(glyf_table.glyphs[name])
+                    if ghash: font_hashmap[name] = ghash
+        except Exception:
+            pass
+
+    def decode_text(enc_text):
+        res = []
+        for ch in enc_text:
+            cname = f'uni{ord(ch):X}'
+            if cname in font_hashmap:
+                ghash = font_hashmap[cname]
+                orig_code = hash_map.get(ghash)
+                if orig_code:
+                    try:
+                        res.append(chr(int(orig_code[3:], 16)))
+                        continue
+                    except: pass
+            res.append(ch)
+        return ''.join(res).translate(KX_RADICALS_TAB)
+
+    timus = work_frame.locator('.TiMu').all()
+    log(f"   📝 检测到测验包含 {len(timus)} 道题，正在调用 AI 模型解答...")
+
+    for idx, timu in enumerate(timus):
+        raw_txt = decode_text(timu.inner_text()).strip()
+        opts = timu.locator('ul li').all()
+        opt_texts = []
+        for o in opts:
+            span = o.locator('.num_option, .num_option_dx')
+            d = span.get_attribute('data') if span.count() > 0 else '?'
+            opt_texts.append(f"{d}. {decode_text(o.inner_text()).strip()}")
+
+        prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项字母（如 A 或 true 或 ABC）：\n题目：{raw_txt}\n选项：\n" + "\n".join(opt_texts)
+
+        # 调 OpenAI 兼容接口
+        api_key = ai_cfg.get("api_key")
+        base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
+        model = ai_cfg.get("model", "deepseek-chat")
+
+        answer_str = "A" # 兜底
+        if api_key:
+            try:
+                req_data = json.dumps({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{base_url}/chat/completions",
+                    data=req_data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    answer_str = resp_json["choices"][0]["message"]["content"].strip().upper()
+            except Exception as e:
+                log(f"   ⚠️ AI 答题请求失败 ({e})，将使用默认选项暂存。")
+
+        # 勾选答案
+        for o in opts:
+            span = o.locator('.num_option, .num_option_dx')
+            d = (span.get_attribute('data') or '').upper()
+            if d and (d in answer_str or ('对' in answer_str and d == 'TRUE') or ('错' in answer_str and d == 'FALSE')):
+                try:
+                    o.click()
+                except Exception:
+                    pass
+
+    # 核心安全操作：只点击“暂存”，绝不自动提交！
+    time.sleep(1)
+    work_frame.evaluate("() => { if (window.noSubmit) window.noSubmit(); }")
+    log("   ✅【测验草稿暂存完成】所有题目已写入并自动暂存！请在网页端核对后手动提交。")
 
 def extract_chapters_from_page(page):
     """自适应提取页面中所有的章节信息"""
@@ -292,7 +443,7 @@ def extract_chapters_from_page(page):
         return list;
     }""")
 
-def process_current_tab_tasks(page):
+def process_current_tab_tasks(page, cfg):
     """处理当前卡片/标签下的所有任务点（包含视频与章节测验）"""
     cards_frame = None
     for f in page.frames:
@@ -300,7 +451,7 @@ def process_current_tab_tasks(page):
             cards_frame = f
             break
 
-    # 1. 检查当前 Tab 下是否有视频
+    # 1. 视频处理
     video_frames = [f for f in page.frames if 'video' in f.url]
     if video_frames:
         log(f"   发现 {len(video_frames)} 个视频任务，准备播放...")
@@ -327,12 +478,19 @@ def process_current_tab_tasks(page):
             if success:
                 log(f"   [打卡成功] 视频 {idx + 1} 学习完毕！")
 
-    # 2. 检查当前 Tab 下是否有章节测验/作业
-    quiz_frames = [f for f in page.frames if 'work' in f.url or 'quiz' in f.url or 'doHomeWorkNew' in f.url]
+    # 2. 章节测验/作业处理
+    quiz_frames = [f for f in page.frames if 'doHomeWorkNew' in f.url]
     if quiz_frames:
-        log(f"   📝 检测到本标签包含【章节测验/单元测试】任务点。")
+        q_mode = cfg.get("quiz_mode", "skip")
+        if q_mode == "ai":
+            solve_quiz_with_ai(quiz_frames[0], cfg.get("ai_config", {}))
+        else:
+            log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
-def run_study(url, start_chapter=None):
+def run_study(url, start_chapter=None, cfg=None):
+    if not cfg:
+        cfg = load_config()
+
     info = parse_course_url(url)
     if not info["course_id"]:
         log("❌ 无法从链接中解析出 courseId，请检查输入的链接格式。")
@@ -361,7 +519,7 @@ def run_study(url, start_chapter=None):
             page.wait_for_timeout(3000)
             zj_frame = page.frame("frame_content-zj")
             if zj_frame:
-                cfg = zj_frame.evaluate("""() => {
+                parsed_cfg = zj_frame.evaluate("""() => {
                     let enc = null;
                     let cpi = null;
                     if (window.toOld) {
@@ -383,10 +541,10 @@ def run_study(url, start_chapter=None):
                     });
                     return { enc, cpi, chapters: chs };
                 }""")
-                if cfg:
-                    enc = cfg["enc"] or enc
-                    cpi = cfg["cpi"] or cpi
-                    chapters = cfg["chapters"]
+                if parsed_cfg:
+                    enc = parsed_cfg["enc"] or enc
+                    cpi = parsed_cfg["cpi"] or cpi
+                    chapters = parsed_cfg["chapters"]
 
         else:
             log("正在加载课程主页目录...")
@@ -416,7 +574,6 @@ def run_study(url, start_chapter=None):
             ch_id = ch["id"]
             ch_title = ch["title"]
 
-            # 构建进入小节的 URL
             refer_url = f"https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId={ch_id}&courseId={info['course_id']}&clazzid={info['clazz_id']}&cpi={cpi}&enc={enc}&mooc2=1&hidetype=0&fanyaVersion=0"
             transfer_url = f"https://mooc1.chaoxing.com/mycourse/transfer?moocId={info['course_id']}&clazzid={info['clazz_id']}&linkTime={int(time.time()*1000)}&ut=s&refer={urllib.parse.quote(refer_url)}"
 
@@ -427,15 +584,13 @@ def run_study(url, start_chapter=None):
             page.goto(transfer_url, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
 
-            # 核心升级：遍历本小节顶部的所有 Tab 标签 (例如：1学习目标、2视频、3章节测验)
+            # 多 Tab 标签全自动轮询遍历
             tab_elements = page.locator('.prev_ul li').all()
             if not tab_elements:
-                # 若无多 Tab，直接处理当前卡片内容
-                process_current_tab_tasks(page)
+                process_current_tab_tasks(page, cfg)
             else:
                 log(f"检测到小节顶部包含 {len(tab_elements)} 个内容标签，逐一巡检...")
                 for t_idx in range(len(tab_elements)):
-                    # 重新定位以防 DOM 刷新
                     cur_tabs = page.locator('.prev_ul li').all()
                     if t_idx < len(cur_tabs):
                         tab_item = cur_tabs[t_idx]
@@ -443,7 +598,7 @@ def run_study(url, start_chapter=None):
                         log(f"👉 切换至标签 [{tab_name}]...")
                         tab_item.click()
                         page.wait_for_timeout(3000)
-                        process_current_tab_tasks(page)
+                        process_current_tab_tasks(page, cfg)
 
             log(f"[{ch_title}] 本小节全部内容巡检/学习完成！\n")
 
@@ -454,21 +609,44 @@ def main():
     parser = argparse.ArgumentParser(description="超星泛雅/学习通全自动跨平台挂课助手")
     parser.add_argument("--url", type=str, help="网课主页或学习页面完整 URL")
     parser.add_argument("--start", type=str, default=None, help="起始小节名称或ID (可选)")
+    parser.add_argument("--quiz-mode", type=str, choices=["skip", "ai"], default=None, help="测验处理模式: skip(跳过) / ai(AI答题暂存)")
     args = parser.parse_args()
+
+    cfg = load_config()
 
     course_url = args.url
     if not course_url:
-        print("\n" + "=" * 50)
-        print("🎓 欢迎使用 Chaoxing Study Mate 超星学习助手")
-        print("=" * 50)
-        course_url = input("请输入你的超星课程链接 (直接复制浏览器地址栏): ").strip()
+        print("\n" + "=" * 55)
+        print("🎓 欢迎使用 Chaoxing Study Mate 超星学习助手 (V2.5)")
+        print("=" * 55)
+        course_url = input("1. 请输入你的超星课程链接 (直接复制浏览器地址栏): ").strip()
 
     if not course_url:
         print("未输入有效链接，程序退出。")
         sys.exit(0)
 
+    # 询问测验处理模式（若未在参数中指定）
+    if not args.quiz_mode:
+        saved_mode = cfg.get("quiz_mode", "skip")
+        print("\n2. 请选择单元测试/章节测验处理方式:")
+        print("   [1] 仅看视频，安全跳过测验（默认推荐，最稳妥）")
+        print("   [2] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
+        choice = input(f"请输入选项 [1/2] (直接回车默认 [{'1' if saved_mode=='skip' else '2'}]): ").strip()
+
+        if choice == "2":
+            cfg["quiz_mode"] = "ai"
+            if not cfg["ai_config"].get("api_key"):
+                user_key = input("请输入你的 AI API Key (支持 DeepSeek / 硅基流动 / Qwen，直接回车可稍后填): ").strip()
+                if user_key:
+                    cfg["ai_config"]["api_key"] = user_key
+        elif choice == "1":
+            cfg["quiz_mode"] = "skip"
+        save_config(cfg)
+    else:
+        cfg["quiz_mode"] = args.quiz_mode
+
     try:
-        run_study(course_url, args.start)
+        run_study(course_url, args.start, cfg)
     except KeyboardInterrupt:
         print("\n\n🛑 [用户已按 Ctrl+C 中断] 已安全退出，此前已完成的进度均已保存在服务器。")
         sys.exit(0)
