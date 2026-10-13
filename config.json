@@ -1,5 +1,5 @@
 {
-  "quiz_mode": "tiku",
+  "quiz_mode": "skip",
   "ai_config": {
     "api_key": "",
     "base_url": "https://api.deepseek.com/v1",

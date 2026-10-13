@@ -8,7 +8,7 @@ echo ========================================================
 echo.
 
 echo [1/3] Detecting network environment and configuring mirrors...
-:: 自动配置国内镜像加速环境变量
+REM Configure Tsinghua open source mirror for ultra fast downloads in China
 set "UV_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 set "PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 

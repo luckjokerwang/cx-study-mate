@@ -615,9 +615,22 @@ def run_study(url, start_chapter=None, cfg=None):
             chapters = extract_chapters_from_page(page)
 
         if not chapters:
-            log("❌ 未能识别到课程章节目录，请确认该课程已开始且已选课。")
-            browser.close()
-            return
+            if "passport2.chaoxing.com/login" in page.url:
+                log("⚠️ 检测到当前账号未登录或在其他设备被迫下线，正在重新唤起扫码登录...")
+                browser.close()
+                if os.path.exists(AUTH_FILE):
+                    os.remove(AUTH_FILE)
+                auth_path = ensure_login(p)
+                browser = launch_browser(p, headless=True)
+                context = browser.new_context(storage_state=auth_path)
+                page = context.new_page()
+                page.goto(info["raw_url"], wait_until="domcontentloaded")
+                page.wait_for_timeout(4000)
+                chapters = extract_chapters_from_page(page)
+            if not chapters:
+                log("❌ 未能识别到课程章节目录，请确认该课程已开始且已选课。")
+                browser.close()
+                return
 
         raw_title = page.title()
         course_name = raw_title.replace("学生学习页面", "").replace("课程门户", "").replace("首页", "").strip() or f"课程_{info['course_id']}"
@@ -666,7 +679,8 @@ def run_study(url, start_chapter=None, cfg=None):
 
             # 多 Tab 标签全自动轮询遍历
             tab_elements = page.locator('.prev_ul li').all()
-            if not tab_elements:
+            if len(tab_elements) <= 1:
+                # 只有 1 个标签或没有标签时，该标签默认已激活且在超星中被隐藏，无需点击切换，直接处理卡片！
                 process_current_tab_tasks(page, cfg)
             else:
                 log(f"检测到小节顶部包含 {len(tab_elements)} 个内容标签，逐一巡检...")
@@ -675,11 +689,18 @@ def run_study(url, start_chapter=None, cfg=None):
                     if t_idx < len(cur_tabs):
                         tab_item = cur_tabs[t_idx]
                         tab_name = tab_item.inner_text().strip().replace('\n', ' ')
-                        log(f"👉 切换至标签 [{tab_name}]...")
-                        tab_item.click()
-                        page.wait_for_timeout(3000)
+                        is_active = "active" in (tab_item.get_attribute("class") or "")
+                        if not is_active:
+                            log(f"👉 切换至标签 [{tab_name}]...")
+                            try:
+                                # 使用原生 JS 点击，规避因 CSS 隐藏/不可见导致的 Playwright click() 30秒超时
+                                tab_item.evaluate("el => el.click()")
+                                page.wait_for_timeout(3000)
+                            except Exception as e:
+                                log(f"   ⚠️ 标签切换异常: {e}")
+                        else:
+                            log(f"👉 当前标签已就绪: [{tab_name}]")
                         process_current_tab_tasks(page, cfg)
-
             log(f"[{ch_title}] 本小节全部内容巡检/学习完成！\n")
 
             # 实时更新保存本地断点缓存
@@ -741,7 +762,11 @@ def main():
         else:
             prompt_str = "1. 请输入你的超星课程链接 (直接复制浏览器地址栏): "
 
-        user_input = input(prompt_str).strip()
+        try:
+            user_input = input(prompt_str).strip()
+        except (EOFError, KeyboardInterrupt):
+            user_input = ""
+
         if not user_input and has_unfinished:
             course_url = cached["url"]
             print(f"⚡ 已自动选择继续上次进度，直达第 {cached.get('last_chapter_index', 1)} 节！")
@@ -760,8 +785,10 @@ def main():
         print("   [2] 公共题库自动答题并【自动暂存草稿】（推荐，零门槛免配置开箱即用）")
         print("   [3] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
         default_disp = '1' if saved_mode == 'skip' else ('2' if saved_mode == 'tiku' else '3')
-        choice = input(f"请输入选项 [1/2/3] (直接回车默认 [{default_disp}]): ").strip()
-
+        try:
+            choice = input(f"请输入选项 [1/2/3] (直接回车默认 [{default_disp}]): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
         if choice == "2":
             cfg["quiz_mode"] = "tiku"
         elif choice == "3":
