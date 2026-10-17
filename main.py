@@ -30,6 +30,7 @@ import hashlib
 import argparse
 import urllib.request
 import urllib.parse
+import math
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -181,6 +182,18 @@ def parse_course_url(input_url):
         "chapter_id": chapter_id
     }
 
+def to_safe_float(val, default=0.0):
+    """安全转换浮点数，过滤 None、NaN 以及 Inf"""
+    try:
+        if val is None:
+            return default
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
 def play_video_frame(page, vf, video_idx, total_videos):
     """控制单集视频播放，监听心跳，达到 100% 结束，具备掉线强校验与看门狗"""
     is_passed = [False]
@@ -200,10 +213,13 @@ def play_video_frame(page, vf, video_idx, total_videos):
     try:
         dur = vf.evaluate("""() => {
             const p = window.videojs ? videojs.getPlayers()['video'] : null;
-            if (!p) return null;
+            if (!p) return 0;
             p.muted(true);
-            p.play();
-            return p.duration();
+            try { p.play(); } catch(e){}
+            const playBtn = document.querySelector('.vjs-big-play-button');
+            if (playBtn && p.paused()) { try { playBtn.click(); } catch(e){} }
+            const d = p.duration();
+            return (typeof d === 'number' && !isNaN(d) && isFinite(d)) ? d : 0;
         }""")
     except Exception as e:
         log(f"   ⚠️ 启动播放异常: {e}")
@@ -211,13 +227,20 @@ def play_video_frame(page, vf, video_idx, total_videos):
         return False
 
     time.sleep(2)
-    dur = vf.evaluate("() => window.videojs && videojs.getPlayers()['video'] ? videojs.getPlayers()['video'].duration() : null")
-    if not dur or str(dur) == 'nan':
-        dur = 0
+    new_dur = vf.evaluate("""() => {
+        const p = window.videojs ? videojs.getPlayers()['video'] : null;
+        if (!p) return 0;
+        const d = p.duration();
+        return (typeof d === 'number' && !isNaN(d) && isFinite(d)) ? d : 0;
+    }""")
+    dur = to_safe_float(new_dur if (new_dur and new_dur > 0) else dur, 0.0)
 
-    log(f"   --> [视频 {video_idx}/{total_videos}] 开始播放，视频时长: {dur:.1f} 秒 ({dur/60:.2f} 分钟)")
+    if dur > 0:
+        log(f"   --> [视频 {video_idx}/{total_videos}] 开始播放，视频时长: {dur:.1f} 秒 ({dur/60:.2f} 分钟)")
+    else:
+        log(f"   --> [视频 {video_idx}/{total_videos}] 开始播放，正在缓冲加载视频...")
 
-    last_log_time = 0
+    last_log_time = time.time()
     last_cur = -1
     stall_count = 0
     error_count = 0
@@ -248,13 +271,15 @@ def play_video_frame(page, vf, video_idx, total_videos):
                     if (submitBtn) submitBtn.click();
                 }
 
-                const cur = p.currentTime();
-                const dur = p.duration();
-                const ended = p.ended();
+                let cur = p.currentTime();
+                let dur = p.duration();
+                if (typeof cur !== 'number' || isNaN(cur) || !isFinite(cur)) cur = 0;
+                if (typeof dur !== 'number' || isNaN(dur) || !isFinite(dur)) dur = 0;
+                const ended = Boolean(p.ended());
 
-                if (!ended && (!dur || cur < dur - 2.5)) {
+                if (!ended && (dur <= 0 || cur < dur - 2.5)) {
                     if (p.paused()) {
-                        p.play();
+                        try { p.play(); } catch(e){}
                     }
                 }
                 return {
@@ -281,15 +306,17 @@ def play_video_frame(page, vf, video_idx, total_videos):
             continue
 
         error_count = 0
-        cur = status['current']
-        dur = status['duration'] or dur
+        cur = to_safe_float(status.get('current'), 0.0)
+        report_dur = to_safe_float(status.get('duration'), 0.0)
+        if report_dur > 0:
+            dur = report_dur
 
-        if cur == last_cur and not status.get('paused') and cur < dur - 5.0:
+        if cur == last_cur and not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
             stall_count += 1
             if stall_count >= 8:
                 log("   ⚠️ [看门狗] 缓冲卡顿超过 40 秒，触发播放器热重载恢复...")
                 try:
-                    vf.evaluate("() => { const p = videojs.getPlayers()['video']; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
+                    vf.evaluate("() => { const p = window.videojs ? videojs.getPlayers()['video'] : null; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
                 except Exception:
                     pass
                 stall_count = 0
@@ -302,14 +329,19 @@ def play_video_frame(page, vf, video_idx, total_videos):
             notified_pass[0] = True
 
         if time.time() - last_log_time >= 25:
-            pct = (cur / dur * 100) if dur > 0 else 0
-            rem_sec = max(0, int(dur - cur))
-            rem_str = f"{rem_sec // 60}分{rem_sec % 60:02d}秒"
-            bar_len = 18
-            filled = int(bar_len * (pct / 100))
-            bar = "█" * filled + "░" * (bar_len - filled)
-            pass_str = " [已通关]" if is_passed[0] else ""
-            log(f"   [{bar}] {pct:5.1f}% | 剩余: {rem_str} | 已播: {int(cur)//60}分{int(cur)%60:02d}秒 / {int(dur)//60}分{int(dur)%60:02d}秒{pass_str}")
+            cur_sec = int(cur)
+            if dur > 0:
+                pct = min(100.0, max(0.0, (cur / dur * 100)))
+                rem_sec = max(0, int(dur - cur))
+                rem_str = f"{rem_sec // 60}分{rem_sec % 60:02d}秒"
+                bar_len = 18
+                filled = int(bar_len * (pct / 100))
+                bar = "█" * filled + "░" * (bar_len - filled)
+                pass_str = " [已通关]" if is_passed[0] else ""
+                dur_sec = int(dur)
+                log(f"   [{bar}] {pct:5.1f}% | 剩余: {rem_str} | 已播: {cur_sec//60}分{cur_sec%60:02d}秒 / {dur_sec//60}分{dur_sec%60:02d}秒{pass_str}")
+            else:
+                log(f"   [缓冲中] 视频正在加载缓冲 (已播: {cur_sec//60}分{cur_sec%60:02d}秒)...")
             last_log_time = time.time()
 
         if status.get('ended') or (dur > 0 and cur >= dur - 2.5):
@@ -332,15 +364,52 @@ def hash_glyph(glyph):
     return hashlib.md5(''.join(pos_data).encode()).hexdigest()
 
 def clean_question_text(q):
+    if not q:
+        return ""
+    # 移除前导题号，如 "1." 或 "12、"
     q = re.sub(r'^[0-9]+[、. ]*', '', q)
-    q = re.sub(r'【.*?】', '', q)
-    q = re.sub(r'\(.*?\)|（.*?）', '', q)
+    # 移除常见题型标签前缀，如 【单选题】、[多选题]、(判断题)
+    q = re.sub(r'^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题)[】\])）]?', '', q)
+    # 规范化空填空括号，保留带有实体区分内容的括号（如“（一）”、“（2023年）”等）
+    q = re.sub(r'[（\(]\s*[）\)]', '（ ）', q)
+    # 移除末尾标点和空白
     q = re.sub(r'[。？！\s]+$', '', q)
     return q.strip()
+
+def query_tiku_api(question, tiku_cfg=None):
+    """优先请求用户配置的私有/自定义题库，若未配置或未命中则回退至公开免费接口"""
+    cq = clean_question_text(question)
+    if not cq:
+        return None
+
+    # 1. 优先尝试用户自定义题库 (config.json 中的 tiku_config)
+    if tiku_cfg and tiku_cfg.get("api_url"):
+        api_url = tiku_cfg["api_url"].strip()
+        token = tiku_cfg.get("token", "").strip()
+        try:
+            req_data = json.dumps({"question": cq, "token": token}).encode("utf-8")
+            headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(api_url, data=req_data, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                ans = res.get("data") if res.get("data") is not None else (res.get("answer") or res.get("result"))
+                if ans:
+                    ans_str = str(ans).strip()
+                    if ans_str and not any(k in ans_str for k in ["未搜索到", "未收录", "李恒雅正在睡觉", "查无此题"]):
+                        return ans_str
+        except Exception:
+            pass
+
+    # 2. 回退到公开免费题库
+    return query_public_tiku(cq)
 
 def query_public_tiku(question):
     """请求去商业化的公开免费题库接口"""
     cq = clean_question_text(question)
+    if not cq:
+        return None
     url = "http://cx.icodef.com/wyn-nb?v=4"
     data = json.dumps({"question": cq}).encode("utf-8")
     req = urllib.request.Request(
@@ -353,18 +422,17 @@ def query_public_tiku(question):
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             res = json.loads(resp.read().decode("utf-8"))
             if res.get("code") == 1:
                 ans = str(res.get("data", "")).strip()
-                # 过滤第三方广告
-                if not any(k in ans for k in ["叛逆", "公众号", "李恒雅", "一之", "付费", "扫码"]):
+                # 过滤第三方广告与无答案提示
+                if not any(k in ans for k in ["叛逆", "公众号", "李恒雅", "一之", "付费", "扫码", "未搜索到", "睡觉觉"]):
                     return ans
     except Exception:
         pass
     return None
-
-def solve_quiz(work_frame, mode="tiku", ai_cfg=None):
+def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
     """解密字体、查题/AI辅助答题并自动点击【暂存草稿】"""
     from fontTools.ttLib.ttFont import TTFont
 
@@ -378,7 +446,7 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None):
 
     font_b64 = work_frame.evaluate("""() => {
         for (let s of document.querySelectorAll('style')) {
-            let m = s.textContent.match(/base64,([\\w\\W]+?)'/);
+            let m = s.textContent.match(/base64,([A-Za-z0-9+/=]+)/);
             if (m) return m[1];
         }
         return null;
@@ -423,7 +491,7 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None):
         answer_str = None
         # 1. 优先尝试公共题库
         if mode == "tiku":
-            answer_str = query_public_tiku(title)
+            answer_str = query_tiku_api(title, tiku_cfg=tiku_cfg)
             if answer_str:
                 log(f"      [题 {idx+1}] 题库命中标准答案: {answer_str}")
             else:
@@ -545,7 +613,7 @@ def process_current_tab_tasks(page, cfg):
     if quiz_frames:
         q_mode = cfg.get("quiz_mode", "skip")
         if q_mode in ["tiku", "ai"]:
-            solve_quiz(quiz_frames[0], mode=q_mode, ai_cfg=cfg.get("ai_config", {}))
+            solve_quiz(quiz_frames[0], mode=q_mode, ai_cfg=cfg.get("ai_config", {}), tiku_cfg=cfg.get("tiku_config", {}))
         else:
             log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
