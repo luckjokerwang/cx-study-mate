@@ -317,6 +317,13 @@ def play_video_frame(page, vf, video_idx, total_videos):
             // 注入反暂停自动唤醒 Hook
             if (!p.__hooked_auto_play) {
                 p.__hooked_auto_play = true;
+                const origPause = p.pause ? p.pause.bind(p) : null;
+                p.pause = function() {
+                    if (p.currentTime() >= p.duration() - 2.5 || p.ended()) {
+                        return origPause ? origPause() : undefined;
+                    }
+                    setTimeout(() => { try { p.play(); } catch(e){} }, 200);
+                };
                 p.on('pause', function() {
                     if (!p.ended()) {
                         setTimeout(() => { try { p.play(); } catch(e){} }, 200);
@@ -406,13 +413,17 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 if (!ended && (dur <= 0 || cur < dur - 2.5)) {
                     if (p.paused()) {
                         try { p.play(); } catch(e){}
+                        const playBtn = document.querySelector('.vjs-big-play-button');
+                        if (playBtn) { try { playBtn.click(); } catch(e){} }
                     }
                 }
+                const isFinished = typeof window.isUnFinishJob === 'function' ? !window.isUnFinishJob() : false;
                 return {
                     current: cur,
                     duration: dur,
                     paused: p.paused(),
-                    ended: ended
+                    ended: ended,
+                    is_finished: isFinished
                 };
             }""")
         except Exception as e:
@@ -436,6 +447,8 @@ def play_video_frame(page, vf, video_idx, total_videos):
         report_dur = to_safe_float(status.get('duration'), 0.0)
         if report_dur > 0:
             dur = report_dur
+        if status.get('is_finished'):
+            is_passed[0] = True
 
         if cur == last_cur and not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
             stall_count += 1
