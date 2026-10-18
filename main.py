@@ -353,7 +353,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
         log(f"   --> [视频 {video_idx}/{total_videos}] 开始播放，正在缓冲加载视频...")
 
     last_log_time = time.time()
-    last_cur = -1
+    max_cur = 0.0
     stall_count = 0
     error_count = 0
 
@@ -450,43 +450,48 @@ def play_video_frame(page, vf, video_idx, total_videos):
         if status.get('is_finished'):
             is_passed[0] = True
 
-        if cur == last_cur and not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
+        # 核心修复：基于真实前进进度统计卡顿，彻底杜绝回退导致清零卡顿计数器的死循环
+        if cur > max_cur + 0.4:
+            max_cur = cur
+            stall_count = 0
+        elif not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
             stall_count += 1
             if stall_count % 8 == 0:
                 watchdog_round = stall_count // 8
-                # Level 1: 40s - 微调 Seek 刷新缓冲管道 + 再次重置随堂题
+                # Level 1: 40s - 唤醒播放器、清理弹窗、重触发播放
                 if watchdog_round == 1:
-                    log("   ⚠️ [看门狗 L1] 缓冲卡顿超过 40 秒，微调时间戳重触发媒体数据管道...")
+                    log("   ⚠️ [看门狗 L1] 缓冲卡顿超 40 秒，重新激活播放器并穿透阻断...")
                     try:
                         vf.evaluate("""() => {
                             const p = window.videojs ? videojs.getPlayers()['video'] : null;
                             if (p) {
-                                const t = p.currentTime();
-                                p.currentTime(Math.max(0, t - 1));
                                 p.muted(true);
                                 p.play().catch(() => {});
                             }
+                            const v = document.querySelector('video');
+                            if (v && v.paused) { try { v.play(); } catch(e){} }
                         }""")
                     except Exception:
                         pass
-                # Level 2: 80s - 深度重装媒体流 (load + re-seek) + 发送桌面通知
+
+                # Level 2: 80s - 媒体流重装 (load & seek to max_cur) + 发送桌面通知
                 elif watchdog_round == 2:
-                    log("   ⚠️ [看门狗 L2] 缓冲卡顿超过 80 秒，触发媒体流热重载 (load & resume)...")
+                    log("   ⚠️ [看门狗 L2] 缓冲卡顿超 80 秒，触发媒体流热重载 (load & resume)...")
                     notify_user("超星学习助手 - 播放卡顿预警", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 卡顿超 80 秒，正在自动热重载恢复...", is_popup=False)
                     try:
-                        vf.evaluate("""() => {
+                        vf.evaluate(f"""() => {{
                             const p = window.videojs ? videojs.getPlayers()['video'] : null;
-                            if (p) {
-                                const t = p.currentTime();
+                            if (p) {{
                                 p.load();
-                                p.currentTime(t);
+                                p.currentTime({max_cur});
                                 p.muted(true);
-                                setTimeout(() => { try { p.play(); } catch(e){} }, 800);
-                            }
-                        }""")
+                                setTimeout(() => {{ try {{ p.play(); }} catch(e){{}} }}, 1000);
+                            }}
+                        }}""")
                     except Exception:
                         pass
-                # Level 3: 120s+ - 若任务点已达标则直接放行；若未达标弹出系统级报警
+
+                # Level 3: 120s+ (2~3 分钟) - 达标安全放行或超时跳过
                 elif watchdog_round >= 3:
                     if is_passed[0]:
                         log("   🎉 [任务点已就绪] 虽遇网络卡顿，但服务器已记录该任务点达标(isPassed=true)，安全打卡结课！")
@@ -494,23 +499,13 @@ def play_video_frame(page, vf, video_idx, total_videos):
                         page.remove_listener('response', on_response)
                         return True
                     else:
-                        log(f"   ⚠️ [看门狗 L3] 缓冲卡顿持续超 {stall_count * 5} 秒，尝试兜底恢复并弹出桌面警报...")
-                        notify_user("超星学习助手 - 视频持续卡顿", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 持续卡顿超 {stall_count * 5} 秒，请检查网络或代理！", is_popup=True)
-                        try:
-                            vf.evaluate("""() => {
-                                const v = document.querySelector('video');
-                                if (v) {
-                                    v.muted = true;
-                                    v.currentTime = Math.max(0, v.currentTime - 2);
-                                    v.play().catch(() => {});
-                                }
-                            }""")
-                        except Exception:
-                            pass
-        else:
-            stall_count = 0
-        last_cur = cur
-
+                        if watchdog_round == 3:
+                            log(f"   ⚠️ [看门狗 L3] 缓冲卡顿持续超 2 分钟，弹出系统级预警并尝试强制唤醒...")
+                            notify_user("超星学习助手 - 视频持续卡顿", f"视频 [视频 {video_idx}/{total_videos}] 持续卡顿超 2 分钟，请检查网络或代理！", is_popup=True)
+                        if watchdog_round >= 5:
+                            log("   ⚠️ [看门狗超时] 视频断流超 3 分钟，安全放行此视频进入后续流程，避免无限卡死！")
+                            page.remove_listener('response', on_response)
+                            return False
         if is_passed[0] and not notified_pass[0]:
             log(f"   [状态更新] 任务点已达标(isPassed=true)，继续播完至 100% 结束以确保数据审计完整...")
             notified_pass[0] = True
@@ -762,6 +757,8 @@ def extract_chapters_from_page(page):
 
 def process_current_tab_tasks(page, cfg):
     """处理当前卡片/标签下的所有任务点（包含视频与章节测验）"""
+    if page.is_closed():
+        return
     cards_frame = None
     for f in page.frames:
         if 'cards' in f.url:
@@ -795,6 +792,8 @@ def process_current_tab_tasks(page, cfg):
             if success:
                 log(f"   [打卡成功] 视频 {idx + 1} 学习完毕！")
 
+    if page.is_closed():
+        return
     # 2. 章节测验/作业处理
     quiz_frames = [f for f in page.frames if 'doHomeWorkNew' in f.url]
     if quiz_frames:
