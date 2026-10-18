@@ -8,5 +8,9 @@
   "tiku_config": {
     "api_url": "",
     "token": ""
+  },
+  "notification": {
+    "enabled": true,
+    "popup": true
   }
 }

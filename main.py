@@ -31,6 +31,10 @@ import argparse
 import urllib.request
 import urllib.parse
 import math
+import shutil
+import subprocess
+import platform
+import threading
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -47,6 +51,90 @@ KX_RADICALS_TAB = str.maketrans(
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
+def notify_user(title, message, is_popup=False):
+    """
+    全平台原生桌面弹窗与通知系统（Windows / macOS / Linux 通用）
+    支持：
+    1. 视频卡顿预警与深度卡顿告警
+    2. 账号顶号下线与运行异常中断弹窗
+    3. 课程全集播放完毕大功告成弹窗
+    """
+    sys.stdout.write('\a')
+    sys.stdout.flush()
+    log(f"🔔【系统提醒】{title}: {message}")
+
+    try:
+        cfg = load_config()
+        notif_cfg = cfg.get("notification", {})
+        if not notif_cfg.get("enabled", True):
+            return
+        if not notif_cfg.get("popup", True):
+            is_popup = False
+    except Exception:
+        pass
+
+    def _dispatch():
+        plat = platform.system().lower()
+        if 'windows' in plat:
+            if is_popup:
+                try:
+                    import ctypes
+                    # MB_ICONINFORMATION (0x40) | MB_SETFOREGROUND (0x10000) | MB_TOPMOST (0x40000)
+                    ctypes.windll.user32.MessageBoxW(0, message, title, 0x40 | 0x10000 | 0x40000)
+                    return
+                except Exception:
+                    pass
+            try:
+                ps_script = (
+                    f'[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms"); '
+                    f'$obj = New-Object System.Windows.Forms.NotifyIcon; '
+                    f'$obj.Icon = [System.Drawing.SystemIcons]::Information; '
+                    f'$obj.BalloonTipTitle = "{title}"; '
+                    f'$obj.BalloonTipText = "{message}"; '
+                    f'$obj.Visible = $True; '
+                    f'$obj.ShowBalloonTip(10000);'
+                )
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        elif 'darwin' in plat:
+            try:
+                safe_msg = message.replace('"', '\\"')
+                safe_title = title.replace('"', '\\"')
+                if is_popup:
+                    cmd = ["osascript", "-e", f'display alert "{safe_title}" message "{safe_msg}" as informational']
+                else:
+                    cmd = ["osascript", "-e", f'display notification "{safe_msg}" with title "{safe_title}"']
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        else:  # Linux (GNOME, KDE, Arch, etc.)
+            if is_popup and shutil.which("zenity"):
+                try:
+                    subprocess.run(["zenity", "--info", f"--title={title}", f"--text={message}", "--timeout=30"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    pass
+            elif is_popup and shutil.which("kdialog"):
+                try:
+                    subprocess.run(["kdialog", f"--title={title}", "--msgbox", message],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    pass
+
+            if shutil.which("notify-send"):
+                try:
+                    urgency = "critical" if is_popup else "normal"
+                    subprocess.run(["notify-send", "-u", urgency, title, message],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+
+    threading.Thread(target=_dispatch, daemon=True).start()
+
 
 def load_config():
     default_cfg = {
@@ -55,6 +143,14 @@ def load_config():
             "api_key": "",
             "base_url": "https://api.deepseek.com/v1",
             "model": "deepseek-chat"
+        },
+        "tiku_config": {
+            "api_url": "",
+            "token": ""
+        },
+        "notification": {
+            "enabled": True,
+            "popup": True
         }
     }
     if os.path.exists(CONFIG_FILE):
@@ -253,6 +349,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
         if any(k in current_page_url for k in ["space/index", "monitor_temp", "passport2.chaoxing.com"]):
             log("\n❌【严重警告】检测到超星账号在其他设备登录已被迫下线！")
             log("请先关闭其他设备上的网页，并在本机重新扫码登录。")
+            notify_user("超星学习助手 - 账号被顶号下线", "检测到超星账号在其他设备登录已被迫下线！请先关闭其他设备并在本机重新扫码登录。", is_popup=True)
             page.remove_listener('response', on_response)
             sys.exit(1)
 
@@ -261,15 +358,27 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 const p = window.videojs ? videojs.getPlayers()['video'] : null;
                 if (!p) return null;
 
-                const quizDialog = document.querySelector('.ans-videoquiz');
-                if (quizDialog && quizDialog.style.display !== 'none') {
-                    const opts = quizDialog.querySelectorAll('input[type="radio"], input[type="checkbox"], .ans-videoquiz-opt');
-                    if (opts.length > 0) {
-                        opts[0].click();
+                // 1. 全面扫描并处理随堂测验与任何阻断弹窗
+                const quiz = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                if (quiz && quiz.style.display !== 'none') {
+                    const inputs = quiz.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+                    if (inputs.length > 0) {
+                        inputs.forEach(i => { if (!i.checked) { try { i.click(); } catch(e){} } });
+                    } else {
+                        const opts = quiz.querySelectorAll('.ans-videoquiz-opt, li');
+                        if (opts.length > 0) { try { opts[0].click(); } catch(e){} }
                     }
-                    const submitBtn = quizDialog.querySelector('.ans-videoquiz-submit, .btnSubmit, button');
-                    if (submitBtn) submitBtn.click();
+                    const submitBtns = quiz.querySelectorAll('.ans-videoquiz-submit, .ans-videoquiz-continue, .btnSubmit, button, .ans-videoquiz-btn');
+                    submitBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }
+
+                // 2. 扫描关闭“继续观看”、“确定”、“我知道了”等课中暂停阻断按钮
+                document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
+                    const txt = (el.innerText || '').trim();
+                    if (['继续观看', '继续播放', '提交', '确定', '我知道了'].includes(txt) || el.classList.contains('ans-videoquiz-continue')) {
+                        try { el.click(); } catch(e){}
+                    }
+                });
 
                 let cur = p.currentTime();
                 let dur = p.duration();
@@ -313,13 +422,61 @@ def play_video_frame(page, vf, video_idx, total_videos):
 
         if cur == last_cur and not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
             stall_count += 1
-            if stall_count >= 8:
-                log("   ⚠️ [看门狗] 缓冲卡顿超过 40 秒，触发播放器热重载恢复...")
-                try:
-                    vf.evaluate("() => { const p = window.videojs ? videojs.getPlayers()['video'] : null; if (p) { p.pause(); setTimeout(() => p.play(), 1000); } }")
-                except Exception:
-                    pass
-                stall_count = 0
+            if stall_count % 8 == 0:
+                watchdog_round = stall_count // 8
+                # Level 1: 40s - 微调 Seek 刷新缓冲管道 + 再次重置随堂题
+                if watchdog_round == 1:
+                    log("   ⚠️ [看门狗 L1] 缓冲卡顿超过 40 秒，微调时间戳重触发媒体数据管道...")
+                    try:
+                        vf.evaluate("""() => {
+                            const p = window.videojs ? videojs.getPlayers()['video'] : null;
+                            if (p) {
+                                const t = p.currentTime();
+                                p.currentTime(Math.max(0, t - 1));
+                                p.muted(true);
+                                p.play().catch(() => {});
+                            }
+                        }""")
+                    except Exception:
+                        pass
+                # Level 2: 80s - 深度重装媒体流 (load + re-seek) + 发送桌面通知
+                elif watchdog_round == 2:
+                    log("   ⚠️ [看门狗 L2] 缓冲卡顿超过 80 秒，触发媒体流热重载 (load & resume)...")
+                    notify_user("超星学习助手 - 播放卡顿预警", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 卡顿超 80 秒，正在自动热重载恢复...", is_popup=False)
+                    try:
+                        vf.evaluate("""() => {
+                            const p = window.videojs ? videojs.getPlayers()['video'] : null;
+                            if (p) {
+                                const t = p.currentTime();
+                                p.load();
+                                p.currentTime(t);
+                                p.muted(true);
+                                setTimeout(() => { try { p.play(); } catch(e){} }, 800);
+                            }
+                        }""")
+                    except Exception:
+                        pass
+                # Level 3: 120s+ - 若任务点已达标则直接放行；若未达标弹出系统级报警
+                elif watchdog_round >= 3:
+                    if is_passed[0]:
+                        log("   🎉 [任务点已就绪] 虽遇网络卡顿，但服务器已记录该任务点达标(isPassed=true)，安全打卡结课！")
+                        time.sleep(2)
+                        page.remove_listener('response', on_response)
+                        return True
+                    else:
+                        log(f"   ⚠️ [看门狗 L3] 缓冲卡顿持续超 {stall_count * 5} 秒，尝试兜底恢复并弹出桌面警报...")
+                        notify_user("超星学习助手 - 视频持续卡顿", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 持续卡顿超 {stall_count * 5} 秒，请检查网络或代理！", is_popup=True)
+                        try:
+                            vf.evaluate("""() => {
+                                const v = document.querySelector('video');
+                                if (v) {
+                                    v.muted = true;
+                                    v.currentTime = Math.max(0, v.currentTime - 2);
+                                    v.play().catch(() => {});
+                                }
+                            }""")
+                        except Exception:
+                            pass
         else:
             stall_count = 0
         last_cur = cur
@@ -632,6 +789,7 @@ def run_study(url, start_chapter=None, cfg=None):
         browser = launch_browser(p, headless=True)
         context = browser.new_context(storage_state=auth_path)
         page = context.new_page()
+        page.on("dialog", lambda dialog: dialog.accept())
 
         chapters = []
         cpi = info["cpi"] or "408853908"
@@ -797,6 +955,7 @@ def run_study(url, start_chapter=None, cfg=None):
             "is_finished": True,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
+        notify_user("超星学习助手 - 学习任务圆满完成", f"恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学习完成！", is_popup=True)
         browser.close()
 
 def main():
@@ -876,6 +1035,10 @@ def main():
     except KeyboardInterrupt:
         print("\n\n🛑 [用户已按 Ctrl+C 中断] 已安全退出，此前已完成的进度均已保存在服务器。")
         sys.exit(0)
+    except Exception as e:
+        log(f"\n❌ [程序发生异常退出]: {e}")
+        notify_user("超星学习助手 - 运行异常中断", f"程序异常退出: {e}，请检查后重新启动。", is_popup=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
