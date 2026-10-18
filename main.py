@@ -39,10 +39,17 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_VERSION = "2.7.0"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
 FONT_MAP_FILE = os.path.join(BASE_DIR, "font_map_table.json")
+VERSION_FILE = os.path.join(BASE_DIR, "version.json")
+UPDATE_MIRRORS = [
+    "https://cdn.jsdelivr.net/gh/luckjokerwang/cx-study-mate@main/",
+    "https://ghproxy.net/https://raw.githubusercontent.com/luckjokerwang/cx-study-mate/main/",
+    "https://raw.githubusercontent.com/luckjokerwang/cx-study-mate/main/"
+]
 KX_RADICALS_TAB = str.maketrans(
     '⼀⼁⼂⼃⼄⼅⼆⼇⼈⼉⼊⼋⼌⼍⼎⼏⼐⼑⼒⼓⼔⼕⼖⼗⼘⼙⼚⼛⼜⼝⼞⼟⼠⼡⼢⼣⼤⼥⼦⼧⼨⼩⼪⼫⼬⼭⼮⼯⼰⼱⼲⼳⼴⼵⼶⼷⼸⼹⼺⼻⼼⼽⼾⼿⽀⽁⽂⽃⽄⽅⽆⽇⽈⽉⽊⽋⽌⽍⽎⽏⽐⽑⽒⽓⽔⽕⽖⽗⽘⽙⽚⽛⽜⽝⽞⽟⽠⽡⽢⽣⽤⽥⽦⽧⽨⽩⽪⽫⽬⽭⽮⽯⽰⽱⽲⽳⽴⽵⽶⽷⽸⽹⽺⽻⽼⽽⽾⽿⾀⾁⾂⾃⾄⾅⾆⾇⾈⾉⾊⾋⾌⾍⾎⾏⾐⾑⾒⾓⾔⾕⾖⾗⾘⾙⾚⾛⾜⾝⾞⾟⾠⾡⾢⾣⾤⾥⾦⾧⾨⾩⾪⾫⾬⾭⾮⾯⾰⾱⾲⾳⾴⾵⾶⾷⾸⾹⾺⾻⾼髙⾽⾾⾿⿀⿁⿂⿃⿄⿅⿆⿇⿈⿉⿊⿋⿌⿍⿎⿏⿐⿑⿒⿓⿔⿕⺠⻬⻩⻢⻜⻅⺟⻓',
     '一丨丶丿乙亅二亠人儿入八冂冖冫几凵刀力勹匕匚匸十卜卩厂厶又口囗土士夂夊夕大女子宀寸小尢尸屮山巛工己巾干幺广廴廾弋弓彐彡彳心戈戶手支攴文斗斤方无日曰月木欠止歹殳毋比毛氏气水火爪父爻爿片牙牛犬玄玉瓜瓦甘生用田疋疒癶白皮皿目矛矢石示禸禾穴立竹米糸缶网羊羽老而耒耳聿肉臣自至臼舌舛舟艮色艸虍虫血行衣襾見角言谷豆豕豸貝赤走足身車辛辰辵邑酉采里金長門阜隶隹雨青非面革韋韭音頁風飞食首香馬骨高高髟鬥鬯鬲鬼魚鳥鹵鹿麥麻黃黍黑黹黽鼎鼓鼠鼻齊齒龍龜龠民齐黄马飞见母长'
@@ -138,6 +145,7 @@ def notify_user(title, message, is_popup=False):
 
 def load_config():
     default_cfg = {
+        "auto_update": True,
         "quiz_mode": "skip",
         "ai_config": {
             "api_key": "",
@@ -167,6 +175,66 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+def check_and_auto_update(cfg):
+    """
+    无 Git 依赖的国内自适应热更新引擎
+    - 支持 ZIP 下载用户无感知开箱即用自动同步 Bug 修复
+    - 基于 jsDelivr / GHProxy 国内高速镜像容灾竞速
+    - 严格执行 Python 语法自检与原子替换，防半截文件损坏
+    - 更新完成后原地 execv 进程热重载，开箱即用永不掉队
+    """
+    if not cfg.get("auto_update", True):
+        return
+    if "--no-update" in sys.argv:
+        return
+
+    for base_url in UPDATE_MIRRORS:
+        ver_url = f"{base_url}version.json"
+        try:
+            req = urllib.request.Request(ver_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                remote_info = json.loads(resp.read().decode("utf-8"))
+                remote_ver = str(remote_info.get("version", "")).strip()
+                changelog = remote_info.get("changelog", "常规稳定性与功能修复")
+                if not remote_ver or remote_ver == APP_VERSION:
+                    return
+
+                log(f"🔄 检测到新版本 v{remote_ver} (当前 v{APP_VERSION}): {changelog}")
+                log("🚀 正在通过高速镜像节点自动同步最新修复代码...")
+
+                main_url = f"{base_url}main.py"
+                main_req = urllib.request.Request(main_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(main_req, timeout=6) as main_resp:
+                    new_code = main_resp.read().decode("utf-8")
+
+                # 关键安全防线：语法自检，防止网络中断下载到 404 或残缺文件破坏主程序
+                compile(new_code, "main_update.py", "exec")
+
+                main_path = os.path.join(BASE_DIR, "main.py")
+                bak_path = os.path.join(BASE_DIR, "main.py.bak")
+                tmp_path = os.path.join(BASE_DIR, "main.py.tmp")
+
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(new_code)
+
+                try:
+                    shutil.copy2(main_path, bak_path)
+                except Exception:
+                    pass
+                os.replace(tmp_path, main_path)
+
+                try:
+                    with open(VERSION_FILE, "w", encoding="utf-8") as f:
+                        json.dump(remote_info, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+                log(f"🎉 成功同步更新至 v{remote_ver}！正在原地热重载启动新版...")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                return
+        except Exception:
+            continue
+
 def load_course_cache():
     """加载上次未完成的课程状态与断点"""
     if os.path.exists(COURSE_CACHE_FILE):
@@ -992,16 +1060,18 @@ def main():
     parser.add_argument("--url", type=str, help="网课主页或学习页面完整 URL")
     parser.add_argument("--start", type=str, default=None, help="起始小节名称或ID (可选)")
     parser.add_argument("--quiz-mode", type=str, choices=["skip", "ai"], default=None, help="测验处理模式: skip(跳过) / ai(AI答题暂存)")
+    parser.add_argument("--no-update", action="store_true", help="跳过自动检测更新")
     args = parser.parse_args()
 
     cfg = load_config()
+    check_and_auto_update(cfg)
     cached = load_course_cache()
     has_unfinished = cached and not cached.get("is_finished") and cached.get("url")
 
     course_url = args.url
     if not course_url:
         print("\n" + "=" * 55)
-        print("🎓 欢迎使用 Chaoxing Study Mate 超星学习助手 (V2.6)")
+        print(f"🎓 欢迎使用 Chaoxing Study Mate 超星学习助手 (V{APP_VERSION})")
         print("=" * 55)
 
         if has_unfinished:
