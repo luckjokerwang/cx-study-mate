@@ -314,6 +314,15 @@ def play_video_frame(page, vf, video_idx, total_videos):
             try { p.play(); } catch(e){}
             const playBtn = document.querySelector('.vjs-big-play-button');
             if (playBtn && p.paused()) { try { playBtn.click(); } catch(e){} }
+            // 注入反暂停自动唤醒 Hook
+            if (!p.__hooked_auto_play) {
+                p.__hooked_auto_play = true;
+                p.on('pause', function() {
+                    if (!p.ended()) {
+                        setTimeout(() => { try { p.play(); } catch(e){} }, 200);
+                    }
+                });
+            }
             const d = p.duration();
             return (typeof d === 'number' && !isNaN(d) && isFinite(d)) ? d : 0;
         }""")
@@ -368,10 +377,18 @@ def play_video_frame(page, vf, video_idx, total_videos):
                         const opts = quiz.querySelectorAll('.ans-videoquiz-opt, li');
                         if (opts.length > 0) { try { opts[0].click(); } catch(e){} }
                     }
-                    const submitBtns = quiz.querySelectorAll('.ans-videoquiz-submit, .ans-videoquiz-continue, .btnSubmit, button, .ans-videoquiz-btn');
+                    const submitBtns = quiz.querySelectorAll('.ans-videoquiz-submit, #videoquiz-submit, .btnSubmit, button, .ans-videoquiz-btn, [class*="submit"]');
                     submitBtns.forEach(b => { try { b.click(); } catch(e){} });
-                }
 
+                    // 借鉴 OCS 思路：上报后直接移除随堂题与 ExtJS 模态遮罩，杜绝遮罩层残留拦截播放器
+                    setTimeout(() => {
+                        try {
+                            const q = document.querySelector('#video .ans-videoquiz, .ans-videoquiz');
+                            if (q) q.remove();
+                            document.querySelectorAll('.x-component-default, .x-mask, .ext-el-mask').forEach(el => el.remove());
+                        } catch(e){}
+                    }, 500);
+                }
                 // 2. 扫描关闭“继续观看”、“确定”、“我知道了”等课中暂停阻断按钮
                 document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
                     const txt = (el.innerText || '').trim();
