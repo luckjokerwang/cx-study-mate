@@ -1,5 +1,6 @@
 {
-  "quiz_mode": "skip",
+  "auto_update": true,
+  "quiz_mode": "tiku",
   "ai_config": {
     "api_key": "",
     "base_url": "https://api.deepseek.com/v1",
@@ -13,5 +14,5 @@
     "enabled": true,
     "popup": true
   },
-  "auto_update": true
+  "headless": false
 }

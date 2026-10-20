@@ -39,7 +39,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
@@ -159,7 +159,8 @@ def load_config():
         "notification": {
             "enabled": True,
             "popup": True
-        }
+        },
+        "headless": True
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -196,7 +197,10 @@ def check_and_auto_update(cfg):
                 remote_info = json.loads(resp.read().decode("utf-8"))
                 remote_ver = str(remote_info.get("version", "")).strip()
                 changelog = remote_info.get("changelog", "常规稳定性与功能修复")
-                if not remote_ver or remote_ver == APP_VERSION:
+                def _vtuple(v):
+                    return tuple(int(x) for x in re.findall(r'\d+', str(v)))
+
+                if not remote_ver or _vtuple(remote_ver) <= _vtuple(APP_VERSION):
                     return
 
                 log(f"🔄 检测到新版本 v{remote_ver} (当前 v{APP_VERSION}): {changelog}")
@@ -358,7 +362,7 @@ def to_safe_float(val, default=0.0):
     except (TypeError, ValueError):
         return default
 
-def play_video_frame(page, vf, video_idx, total_videos):
+def play_video_frame(page, vf, video_idx, total_videos, cfg=None):
     """控制单集视频播放，监听心跳，达到 100% 结束，具备掉线强校验与看门狗"""
     is_passed = [False]
     notified_pass = [False]
@@ -387,14 +391,33 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 p.__hooked_auto_play = true;
                 const origPause = p.pause ? p.pause.bind(p) : null;
                 p.pause = function() {
+                    // 当页面存在可见的随堂测验时，允许正常暂停答题，严禁高频抢锁造成死锁震荡
+                    const quiz = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                    if (quiz && quiz.style.display !== 'none') {
+                        return origPause ? origPause() : undefined;
+                    }
                     if (p.currentTime() >= p.duration() - 2.5 || p.ended()) {
                         return origPause ? origPause() : undefined;
                     }
-                    setTimeout(() => { try { p.play(); } catch(e){} }, 200);
+                    setTimeout(() => {
+                        const q = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                        if (!q || q.style.display === 'none') {
+                            try { p.play(); } catch(e){}
+                        }
+                    }, 300);
                 };
                 p.on('pause', function() {
+                    const quiz = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                    if (quiz && quiz.style.display !== 'none') {
+                        return; // 有测验弹窗时允许正常暂停
+                    }
                     if (!p.ended()) {
-                        setTimeout(() => { try { p.play(); } catch(e){} }, 200);
+                        setTimeout(() => {
+                            const q = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                            if (!q || q.style.display === 'none') {
+                                try { p.play(); } catch(e){}
+                            }
+                        }, 300);
                     }
                 });
             }
@@ -424,6 +447,8 @@ def play_video_frame(page, vf, video_idx, total_videos):
     max_cur = 0.0
     stall_count = 0
     error_count = 0
+    current_quiz_key = None
+    quiz_attempt = 0
 
     while True:
         time.sleep(5)
@@ -444,26 +469,39 @@ def play_video_frame(page, vf, video_idx, total_videos):
 
                 // 1. 全面扫描并处理随堂测验与任何阻断弹窗
                 const quiz = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                let quizInfo = null;
                 if (quiz && quiz.style.display !== 'none') {
-                    const inputs = quiz.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-                    if (inputs.length > 0) {
-                        inputs.forEach(i => { if (!i.checked) { try { i.click(); } catch(e){} } });
-                    } else {
-                        const opts = quiz.querySelectorAll('.ans-videoquiz-opt, li');
-                        if (opts.length > 0) { try { opts[0].click(); } catch(e){} }
+                    // 若有“继续观看”已激活直接点击
+                    const contBtn = quiz.querySelector('.ans-videoquiz-continue, [class*="continue"]');
+                    if (contBtn && contBtn.offsetParent !== null) {
+                        try { contBtn.click(); } catch(e){}
                     }
-                    const submitBtns = quiz.querySelectorAll('.ans-videoquiz-submit, #videoquiz-submit, .btnSubmit, button, .ans-videoquiz-btn, [class*="submit"]');
-                    submitBtns.forEach(b => { try { b.click(); } catch(e){} });
 
-                    // 借鉴 OCS 思路：上报后直接移除随堂题与 ExtJS 模态遮罩，杜绝遮罩层残留拦截播放器
-                    setTimeout(() => {
-                        try {
-                            const q = document.querySelector('#video .ans-videoquiz, .ans-videoquiz');
-                            if (q) q.remove();
-                            document.querySelectorAll('.x-component-default, .x-mask, .ext-el-mask').forEach(el => el.remove());
-                        } catch(e){}
-                    }, 500);
+                    const titleEl = quiz.querySelector('.ans-videoquiz-title');
+                    const rawTitle = titleEl ? titleEl.innerText.trim() : '';
+
+                    const radios = Array.from(quiz.querySelectorAll('input[type="radio"]'));
+                    const checkboxes = Array.from(quiz.querySelectorAll('input[type="checkbox"]'));
+
+                    let opts = [];
+                    const lis = Array.from(quiz.querySelectorAll('.ans-videoquiz-opt li, ul li'));
+                    if (lis.length > 0) {
+                        opts = lis.map((el, i) => ({ index: i, text: el.innerText.trim() }));
+                    } else {
+                        const labels = Array.from(quiz.querySelectorAll('.ans-videoquiz-opt label, label'));
+                        if (labels.length > 0) {
+                            opts = labels.map((el, i) => ({ index: i, text: el.innerText.trim() }));
+                        }
+                    }
+
+                    quizInfo = {
+                        title: rawTitle,
+                        options: opts,
+                        radios_count: radios.length,
+                        checkboxes_count: checkboxes.length
+                    };
                 }
+
                 // 2. 扫描关闭“继续观看”、“确定”、“我知道了”等课中暂停阻断按钮
                 document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
                     const txt = (el.innerText || '').trim();
@@ -478,7 +516,7 @@ def play_video_frame(page, vf, video_idx, total_videos):
                 if (typeof dur !== 'number' || isNaN(dur) || !isFinite(dur)) dur = 0;
                 const ended = Boolean(p.ended());
 
-                if (!ended && (dur <= 0 || cur < dur - 2.5)) {
+                if (!ended && !quizInfo && (dur <= 0 || cur < dur - 2.5)) {
                     if (p.paused()) {
                         try { p.play(); } catch(e){}
                         const playBtn = document.querySelector('.vjs-big-play-button');
@@ -491,7 +529,8 @@ def play_video_frame(page, vf, video_idx, total_videos):
                     duration: dur,
                     paused: p.paused(),
                     ended: ended,
-                    is_finished: isFinished
+                    is_finished: isFinished,
+                    quiz_info: quizInfo
                 };
             }""")
         except Exception as e:
@@ -518,11 +557,156 @@ def play_video_frame(page, vf, video_idx, total_videos):
         if status.get('is_finished'):
             is_passed[0] = True
 
+        # 穿透处理顶级页面可能的阻断弹窗
+        try:
+            page.evaluate("""() => {
+                document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
+                    const txt = (el.innerText || '').trim();
+                    if (['继续观看', '继续播放', '确定', '我知道了'].includes(txt)) {
+                        try { el.click(); } catch(e){}
+                    }
+                });
+            }""")
+        except Exception:
+            pass
+
+        quiz_info = status.get('quiz_info')
+        if quiz_info:
+            stall_count = 0  # 随堂测验不计入视频卡顿
+            raw_title = quiz_info.get('title', '').strip()
+            options = quiz_info.get('options', [])
+
+            quiz_key = f"{int(cur)}_{raw_title[:20]}"
+            if current_quiz_key != quiz_key:
+                current_quiz_key = quiz_key
+                quiz_attempt = 0
+            quiz_attempt += 1
+
+            matched_idx = -1
+            clean_t = clean_question_text(raw_title)
+
+            # 首轮尝试题库与 AI 精准匹配
+            if quiz_attempt == 1 and clean_t and options:
+                disp_title = clean_t if len(clean_t) <= 32 else clean_t[:32] + "..."
+                log(f"   📝 [随堂测验] 视频在 {int(cur)//60}分{int(cur)%60:02d}秒 触发测验: 《{disp_title}》")
+                log(f"      🔍 正在调用题库/AI 检索标准答案...")
+
+                tiku_cfg = (cfg or {}).get("tiku_config", {})
+                ai_cfg = (cfg or {}).get("ai_config", {})
+
+                # 1. 优先题库查询
+                try:
+                    ans = query_tiku_api(clean_t, tiku_cfg=tiku_cfg)
+                except Exception:
+                    ans = None
+
+                if ans:
+                    log(f"      🎯 题库命中标准答案: {ans}")
+                    matched_idx = match_option_index(ans, options)
+
+                # 2. 题库未命中且配置了 AI，请求 AI 辅助
+                if matched_idx < 0 and ai_cfg.get("api_key"):
+                    opt_strings = [o.get("text", "") for o in options]
+                    ai_ans = query_ai_for_question(clean_t, opt_strings, ai_cfg)
+                    if ai_ans:
+                        log(f"      🤖 AI 辅助解答给出: {ai_ans}")
+                        matched_idx = match_option_index(ai_ans, options)
+
+            # 确定作答动作（精准匹配 vs 轮换兜底）
+            action_desc = ""
+            if matched_idx >= 0:
+                action_desc = f"题库/AI 精准选中选项 [{matched_idx + 1}/{len(options)}]"
+            else:
+                if quiz_attempt == 1:
+                    log("      ⚠️ 题库/AI 未收录此题，自动无缝启动选项轮换兜底...")
+                action_desc = f"轮换兜底尝试 #{quiz_attempt}"
+
+            log(f"      👉 正在提交作答 ({action_desc})...")
+
+            try:
+                vf.evaluate("""({ targetIdx, attempt }) => {
+                    const quiz = document.querySelector('.ans-videoquiz, .ans-cc, .x-window');
+                    if (!quiz) return;
+
+                    const radios = Array.from(quiz.querySelectorAll('input[type="radio"]'));
+                    const checkboxes = Array.from(quiz.querySelectorAll('input[type="checkbox"]'));
+                    const opts = Array.from(quiz.querySelectorAll('.ans-videoquiz-opt li, .ans-videoquiz-opt label, .ans-videoquiz-opt, li'));
+
+                    let selectIdx = targetIdx;
+                    if (selectIdx < 0) {
+                        const count = radios.length || opts.length || 1;
+                        selectIdx = (attempt - 1) % count;
+                    }
+
+                    if (radios.length > 0) {
+                        radios.forEach((r, idx) => {
+                            if (idx === selectIdx) {
+                                r.checked = true;
+                                 try { r.click(); } catch(e){}
+                            } else {
+                                r.checked = false;
+                            }
+                        });
+                    } else if (checkboxes.length > 0) {
+                        checkboxes.forEach((c, idx) => {
+                            if (targetIdx >= 0) {
+                                if (idx === targetIdx && !c.checked) { try { c.click(); } catch(e){} }
+                            } else {
+                                if (!c.checked) { try { c.click(); } catch(e){} }
+                            }
+                        });
+                    } else if (opts.length > 0 && selectIdx < opts.length) {
+                        try { opts[selectIdx].click(); } catch(e){}
+                    }
+
+                    // 提交
+                    setTimeout(() => {
+                        const submitBtns = quiz.querySelectorAll('.ans-videoquiz-submit, #videoquiz-submit, .btnSubmit, button, .ans-videoquiz-btn, [class*="submit"]');
+                        submitBtns.forEach(b => { try { b.click(); } catch(e){} });
+                    }, 250);
+
+                    // 延迟尝试穿透继续观看
+                    setTimeout(() => {
+                        const cb = quiz.querySelector('.ans-videoquiz-continue, [class*="continue"]');
+                        if (cb) { try { cb.click(); } catch(e){} }
+                        document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
+                            const txt = (el.innerText || '').trim();
+                            if (['继续观看', '继续播放', '提交', '确定', '我知道了'].includes(txt)) {
+                                try { el.click(); } catch(e){}
+                            }
+                        });
+                    }, 650);
+
+                    // 极端兜底：连续超 8 次尝试（40秒）尝试清除遮罩
+                    if (attempt >= 8) {
+                        setTimeout(() => {
+                            try {
+                                document.querySelectorAll('.x-component-default, .x-mask, .ext-el-mask').forEach(el => el.remove());
+                            } catch(e){}
+                        }, 800);
+                    }
+                }""", {"targetIdx": matched_idx, "attempt": quiz_attempt})
+            except Exception as e:
+                log(f"      ⚠️ 作答提交异常: {e}")
+
+            time.sleep(2)
+            continue
+        else:
+            current_quiz_key = None
+            quiz_attempt = 0
+
         # 核心修复：基于真实前进进度统计卡顿，彻底杜绝回退导致清零卡顿计数器的死循环
         if cur > max_cur + 0.4:
             max_cur = cur
             stall_count = 0
         elif not status.get('paused') and (dur <= 0 or cur < dur - 5.0):
+            # 若服务器已记录该任务点达标，无需漫长等待看门狗，立即安全结课
+            if is_passed[0]:
+                log("   🎉 [任务点已达标] 检测到服务器已记录该任务点达标 (isPassed=true)，遇缓冲阻滞安全放行！")
+                time.sleep(2)
+                page.remove_listener('response', on_response)
+                return True
+
             stall_count += 1
             if stall_count % 8 == 0:
                 watchdog_round = stall_count // 8
@@ -538,22 +722,46 @@ def play_video_frame(page, vf, video_idx, total_videos):
                             }
                             const v = document.querySelector('video');
                             if (v && v.paused) { try { v.play(); } catch(e){} }
+                            document.querySelectorAll('button, a, span, .ans-videoquiz-continue').forEach(el => {
+                                const txt = (el.innerText || '').trim();
+                                if (['继续观看', '继续播放', '确定', '我知道了'].includes(txt) || el.classList.contains('ans-videoquiz-continue')) {
+                                    try { el.click(); } catch(e){}
+                                }
+                            });
                         }""")
                     except Exception:
                         pass
 
-                # Level 2: 80s - 媒体流重装 (load & seek to max_cur) + 发送桌面通知
+                # Level 2: 80s - 智能跃过死锁帧 (+1.5s) 与可靠的媒体流恢复
                 elif watchdog_round == 2:
-                    log("   ⚠️ [看门狗 L2] 缓冲卡顿超 80 秒，触发媒体流热重载 (load & resume)...")
-                    notify_user("超星学习助手 - 播放卡顿预警", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 卡顿超 80 秒，正在自动热重载恢复...", is_popup=False)
+                    log("   ⚠️ [看门狗 L2] 缓冲卡顿超 80 秒，触发媒体流热恢复与死锁点跨越...")
+                    notify_user("超星学习助手 - 播放卡顿预警", f"视频 [视频 {video_idx}/{total_videos}] 在 {int(cur)//60}分{int(cur)%60:02d}秒 卡顿超 80 秒，正在自动热恢复...", is_popup=False)
                     try:
                         vf.evaluate(f"""() => {{
                             const p = window.videojs ? videojs.getPlayers()['video'] : null;
                             if (p) {{
-                                p.load();
-                                p.currentTime({max_cur});
-                                p.muted(true);
-                                setTimeout(() => {{ try {{ p.play(); }} catch(e){{}} }}, 1000);
+                                const dur = p.duration() || 0;
+                                const target = (dur > 0 && {max_cur} + 1.5 < dur) ? {max_cur} + 1.5 : {max_cur};
+                                // 1. 先尝试直接跨越死锁点并播放
+                                try {{
+                                    p.currentTime(target);
+                                    p.muted(true);
+                                    p.play().catch(() => {{}});
+                                }} catch(e){{}}
+
+                                // 2. 注册 loadedmetadata 确保即使 reload 也能精准定位
+                                p.one('loadedmetadata', () => {{
+                                    try {{ p.currentTime(target); }} catch(e){{}}
+                                    p.muted(true);
+                                    setTimeout(() => {{ try {{ p.play(); }} catch(e){{}} }}, 600);
+                                }});
+
+                                // 3. 若依然暂停或卡死，执行 load() 重建媒体管道
+                                setTimeout(() => {{
+                                    if (p.paused() || p.currentTime() <= {max_cur}) {{
+                                        try {{ p.load(); }} catch(e){{}}
+                                    }}
+                                }}, 1200);
                             }}
                         }}""")
                     except Exception:
@@ -570,6 +778,16 @@ def play_video_frame(page, vf, video_idx, total_videos):
                         if watchdog_round == 3:
                             log(f"   ⚠️ [看门狗 L3] 缓冲卡顿持续超 2 分钟，弹出系统级预警并尝试强制唤醒...")
                             notify_user("超星学习助手 - 视频持续卡顿", f"视频 [视频 {video_idx}/{total_videos}] 持续卡顿超 2 分钟，请检查网络或代理！", is_popup=True)
+                            try:
+                                vf.evaluate("""() => {
+                                    const v = document.querySelector('video');
+                                    if (v) {
+                                        v.muted = true;
+                                        v.play().catch(() => {});
+                                    }
+                                }""")
+                            except Exception:
+                                pass
                         if watchdog_round >= 5:
                             log("   ⚠️ [看门狗超时] 视频断流超 3 分钟，安全放行此视频进入后续流程，避免无限卡死！")
                             page.remove_listener('response', on_response)
@@ -682,6 +900,82 @@ def query_public_tiku(question):
     except Exception:
         pass
     return None
+
+def query_ai_for_question(title, opt_texts, ai_cfg):
+    """通用 AI 答题请求封装，供随堂测验与章节测验复用"""
+    if not ai_cfg or not ai_cfg.get("api_key"):
+        return None
+    api_key = str(ai_cfg["api_key"]).strip()
+    if not api_key:
+        return None
+    base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
+    model = ai_cfg.get("model", "deepseek-chat")
+
+    formatted_opts = "\n".join(opt_texts) if isinstance(opt_texts, list) else str(opt_texts)
+    prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项内容或字母（如 A 或 错误 或 A,B）：\n题目：{title}\n选项：\n{formatted_opts}"
+    try:
+        req_data = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}).encode("utf-8")
+        req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log(f"      ⚠️ AI 请求失败: {e}")
+        return None
+
+def match_option_index(answer_str, options):
+    """根据题库/AI 答案字符串，在选项列表中匹配最佳选项索引 (0-based)"""
+    if not answer_str or not options:
+        return -1
+    ans_clean = clean_question_text(answer_str).strip()
+
+    # 1. 单字母前缀匹配 (例如答案为 "A" 或 "B.")
+    m = re.match(r'^([A-Za-z])(?:[、. ]|$)', ans_clean)
+    if m:
+        letter = m.group(1).upper()
+        target_idx = ord(letter) - ord('A')
+        if 0 <= target_idx < len(options):
+            return target_idx
+
+    # 2. 判断题关键字匹配
+    if re.search(r'(正确|对|true|是|√)', ans_clean, re.I):
+        for idx, o in enumerate(options):
+            txt = o.get('text', '') if isinstance(o, dict) else str(o)
+            if any(k in txt for k in ["正确", "对", "√"]):
+                return idx
+        return 0
+    elif re.search(r'(错误|错|false|否|×)', ans_clean, re.I):
+        for idx, o in enumerate(options):
+            txt = o.get('text', '') if isinstance(o, dict) else str(o)
+            if any(k in txt for k in ["错误", "错", "×"]):
+                return idx
+        if len(options) > 1:
+            return 1
+
+    # 3. 文本最佳匹配 (全词 / 子串 / 字符重合度)
+    best_idx = -1
+    best_score = 0.0
+    ans_parts = [a.strip() for a in re.split(r'[#;,/ ]', ans_clean) if a.strip()]
+    for ans_item in ans_parts:
+        for idx, o in enumerate(options):
+            opt_text = (o.get('text', '') if isinstance(o, dict) else str(o)).strip()
+            opt_body = re.sub(r'^[A-Za-z][、. ]*', '', opt_text).strip()
+            if not opt_body:
+                continue
+            if ans_item == opt_text or ans_item == opt_body:
+                return idx
+            if len(ans_item) > 1 and (ans_item in opt_body or opt_body in ans_item):
+                return idx
+            s1, s2 = set(ans_item), set(opt_body)
+            overlap = len(s1 & s2) / max(len(s1), 1)
+            if overlap > best_score:
+                best_score = overlap
+                best_idx = idx
+
+    if best_score >= 0.6:
+        return best_idx
+
+    return -1
 def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
     """解密字体、查题/AI辅助答题并自动点击【暂存草稿】"""
     from fontTools.ttLib.ttFont import TTFont
@@ -750,20 +1044,9 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
         # 2. 如果是 AI 模式或题库未命中且配置了 AI
         if not answer_str and (mode == "ai" or (ai_cfg and ai_cfg.get("api_key"))):
             opt_texts = [f"{o.locator('.num_option, .num_option_dx').inner_text().strip()}. {decode_text(o.inner_text()).strip()}" for o in opts]
-            prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项内容或字母（如 A 或 错误 或 A,B）：\n题目：{title}\n选项：\n" + "\n".join(opt_texts)
-            api_key = (ai_cfg or {}).get("api_key")
-            base_url = (ai_cfg or {}).get("base_url", "https://api.deepseek.com/v1").rstrip("/")
-            model = (ai_cfg or {}).get("model", "deepseek-chat")
-            if api_key:
-                try:
-                    req_data = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}).encode("utf-8")
-                    req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        answer_str = res["choices"][0]["message"]["content"].strip()
-                        log(f"      [题 {idx+1}] AI 解答: {answer_str}")
-                except Exception as e:
-                    log(f"      [题 {idx+1}] AI 请求失败: {e}")
+            answer_str = query_ai_for_question(title, opt_texts, ai_cfg)
+            if answer_str:
+                log(f"      [题 {idx+1}] AI 解答: {answer_str}")
 
         if not answer_str:
             continue
@@ -856,7 +1139,7 @@ def process_current_tab_tasks(page, cfg):
                 log(f"   --> [视频 {idx + 1}/{len(video_frames)}] 此前已打卡完成，跳过。")
                 continue
 
-            success = play_video_frame(page, vf, idx + 1, len(video_frames))
+            success = play_video_frame(page, vf, idx + 1, len(video_frames), cfg=cfg)
             if success:
                 log(f"   [打卡成功] 视频 {idx + 1} 学习完毕！")
 
@@ -880,10 +1163,11 @@ def run_study(url, start_chapter=None, cfg=None):
         log("❌ 无法从链接中解析出 courseId，请检查输入的链接格式。")
         return
 
+    is_headless = cfg.get("headless", True)
     with sync_playwright() as p:
         auth_path = ensure_login(p)
 
-        browser = launch_browser(p, headless=True)
+        browser = launch_browser(p, headless=is_headless)
         context = browser.new_context(storage_state=auth_path)
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
@@ -944,7 +1228,7 @@ def run_study(url, start_chapter=None, cfg=None):
                 if os.path.exists(AUTH_FILE):
                     os.remove(AUTH_FILE)
                 auth_path = ensure_login(p)
-                browser = launch_browser(p, headless=True)
+                browser = launch_browser(p, headless=is_headless)
                 context = browser.new_context(storage_state=auth_path)
                 page = context.new_page()
                 page.goto(info["raw_url"], wait_until="domcontentloaded")
@@ -1060,6 +1344,7 @@ def main():
     parser.add_argument("--url", type=str, help="网课主页或学习页面完整 URL")
     parser.add_argument("--start", type=str, default=None, help="起始小节名称或ID (可选)")
     parser.add_argument("--quiz-mode", type=str, choices=["skip", "ai"], default=None, help="测验处理模式: skip(跳过) / ai(AI答题暂存)")
+    parser.add_argument("--headful", action="store_true", help="显示浏览器窗口（用于直观排查卡顿或界面验证）")
     parser.add_argument("--no-update", action="store_true", help="跳过自动检测更新")
     args = parser.parse_args()
 
@@ -1067,6 +1352,8 @@ def main():
     check_and_auto_update(cfg)
     cached = load_course_cache()
     has_unfinished = cached and not cached.get("is_finished") and cached.get("url")
+    if args.headful:
+        cfg["headless"] = False
 
     course_url = args.url
     if not course_url:
