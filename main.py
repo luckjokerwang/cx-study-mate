@@ -58,7 +58,7 @@ KX_RADICALS_TAB = str.maketrans(
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
-def notify_user(title, message, is_popup=False):
+def notify_user(title, message, is_popup=False, block=False):
     """
     全平台原生桌面弹窗与通知系统（Windows / macOS / Linux 通用）
     支持：
@@ -77,9 +77,9 @@ def notify_user(title, message, is_popup=False):
             return
         if not notif_cfg.get("popup", True):
             is_popup = False
+        is_persistent = notif_cfg.get("persistent", True)
     except Exception:
-        pass
-
+        is_persistent = True
     def _dispatch():
         plat = platform.system().lower()
         if 'windows' in plat:
@@ -92,6 +92,7 @@ def notify_user(title, message, is_popup=False):
                 except Exception:
                     pass
             try:
+                show_timeout = 0 if is_persistent else 10000
                 ps_script = (
                     f'[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms"); '
                     f'$obj = New-Object System.Windows.Forms.NotifyIcon; '
@@ -99,7 +100,7 @@ def notify_user(title, message, is_popup=False):
                     f'$obj.BalloonTipTitle = "{title}"; '
                     f'$obj.BalloonTipText = "{message}"; '
                     f'$obj.Visible = $True; '
-                    f'$obj.ShowBalloonTip(10000);'
+                    f'$obj.ShowBalloonTip({show_timeout});'
                 )
                 subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -117,30 +118,53 @@ def notify_user(title, message, is_popup=False):
             except Exception:
                 pass
         else:  # Linux (GNOME, KDE, Arch, etc.)
-            if is_popup and shutil.which("zenity"):
-                try:
-                    subprocess.run(["zenity", "--info", f"--title={title}", f"--text={message}", "--timeout=30"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return
-                except Exception:
-                    pass
-            elif is_popup and shutil.which("kdialog"):
-                try:
-                    subprocess.run(["kdialog", f"--title={title}", "--msgbox", message],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return
-                except Exception:
-                    pass
-
+            if is_popup:
+                if shutil.which("zenity"):
+                    try:
+                        if block:
+                            subprocess.run(
+                                ["zenity", "--info", f"--title={title}", f"--text={message}"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            )
+                        else:
+                            subprocess.Popen(
+                                ["zenity", "--info", f"--title={title}", f"--text={message}"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True
+                            )
+                    except Exception:
+                        pass
+                elif shutil.which("kdialog"):
+                    try:
+                        if block:
+                            subprocess.run(
+                                ["kdialog", f"--title={title}", "--msgbox", message],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            )
+                        else:
+                            subprocess.Popen(
+                                ["kdialog", f"--title={title}", "--msgbox", message],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True
+                            )
+                    except Exception:
+                        pass
             if shutil.which("notify-send"):
                 try:
                     urgency = "critical" if is_popup else "normal"
-                    subprocess.run(["notify-send", "-u", urgency, title, message],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # -t 0 告知通知中心永不超时自动消失，用户不主动点击或清理则一直常驻
+                    expire_args = ["-t", "0"] if is_persistent else []
+                    subprocess.run(
+                        ["notify-send", "-u", urgency, *expire_args, title, message],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
                 except Exception:
                     pass
 
-    threading.Thread(target=_dispatch, daemon=True).start()
+    if block:
+        _dispatch()
+    else:
+        threading.Thread(target=_dispatch, daemon=False).start()
 
 
 def load_config():
@@ -158,7 +182,8 @@ def load_config():
         },
         "notification": {
             "enabled": True,
-            "popup": True
+            "popup": True,
+            "persistent": True
         },
         "headless": True
     }
@@ -1154,6 +1179,21 @@ def process_current_tab_tasks(page, cfg):
         else:
             log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
+def safe_goto(page, url, wait_until="domcontentloaded", timeout=45000, max_retries=5):
+    """具备抗网络丢包、DNS 瞬时抖动与自动容灾重试的安全页面导航"""
+    for try_idx in range(1, max_retries + 1):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout)
+            return True
+        except Exception as e:
+            err_line = str(e).split('\n')[0]
+            if try_idx < max_retries:
+                log(f"   ⚠️ 页面导航/域名解析瞬时波动 ({err_line})，3 秒后自动重试 [{try_idx}/{max_retries}]...")
+                time.sleep(3)
+            else:
+                log(f"   ❌ 页面访问连续 {max_retries} 次失败: {err_line}")
+                raise
+
 def run_study(url, start_chapter=None, cfg=None):
     if not cfg:
         cfg = load_config()
@@ -1178,13 +1218,13 @@ def run_study(url, start_chapter=None, cfg=None):
 
         if info["is_study_page"]:
             log("检测到输入链接为具体小节学习页面，正在直接加载并提取完整目录...")
-            page.goto(info["raw_url"], wait_until="domcontentloaded")
+            safe_goto(page, info["raw_url"], wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
             chapters = extract_chapters_from_page(page)
 
         elif info["is_mooc2_portal"]:
             log("检测到输入链接为 MOOC2 课程门户首页，正在加载章节框架...")
-            page.goto(info["raw_url"], wait_until="networkidle")
+            safe_goto(page, info["raw_url"], wait_until="networkidle")
             page.wait_for_timeout(3000)
             zj_frame = page.frame("frame_content-zj")
             if zj_frame:
@@ -1217,7 +1257,7 @@ def run_study(url, start_chapter=None, cfg=None):
 
         else:
             log("正在加载课程主页目录...")
-            page.goto(info["raw_url"], wait_until="networkidle")
+            safe_goto(page, info["raw_url"], wait_until="networkidle")
             page.wait_for_timeout(3000)
             chapters = extract_chapters_from_page(page)
 
@@ -1231,7 +1271,7 @@ def run_study(url, start_chapter=None, cfg=None):
                 browser = launch_browser(p, headless=is_headless)
                 context = browser.new_context(storage_state=auth_path)
                 page = context.new_page()
-                page.goto(info["raw_url"], wait_until="domcontentloaded")
+                safe_goto(page, info["raw_url"], wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
                 chapters = extract_chapters_from_page(page)
             if not chapters:
@@ -1281,7 +1321,7 @@ def run_study(url, start_chapter=None, cfg=None):
             log(f"正在进入小节 [{current_abs_idx + 1}/{len(chapters)}]: {ch_title} (ID: {ch_id})")
             log(f"==================================================")
 
-            page.goto(transfer_url, wait_until="domcontentloaded")
+            safe_goto(page, transfer_url, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
 
             # 多 Tab 标签全自动轮询遍历
@@ -1336,8 +1376,15 @@ def run_study(url, start_chapter=None, cfg=None):
             "is_finished": True,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
-        notify_user("超星学习助手 - 学习任务圆满完成", f"恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学习完成！", is_popup=True)
+        notify_user("超星学习助手 - 学习任务圆满完成", f"恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学习完成！", is_popup=True, block=True)
         browser.close()
+        print("\n" + "=" * 55)
+        print(f"🎉 恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学完打卡！")
+        print("=" * 55)
+        try:
+            input("\n请按 [回车] 键安全退出程序...")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 def main():
     parser = argparse.ArgumentParser(description="超星泛雅/学习通全自动跨平台挂课助手")
@@ -1352,8 +1399,6 @@ def main():
     check_and_auto_update(cfg)
     cached = load_course_cache()
     has_unfinished = cached and not cached.get("is_finished") and cached.get("url")
-    if args.headful:
-        cfg["headless"] = False
 
     course_url = args.url
     if not course_url:
@@ -1415,6 +1460,27 @@ def main():
         save_config(cfg)
     else:
         cfg["quiz_mode"] = args.quiz_mode
+
+    # 询问浏览器显示模式（若命令行未强制指定 --headful）
+    if not args.headful:
+        saved_headless = cfg.get("headless", True)
+        default_hl = "1" if saved_headless else "2"
+        print("\n3. 请选择浏览器运行显示方式:")
+        print("   [1] 后台静默运行（无头模式，省 CPU/内存，挂机推荐）")
+        print("   [2] 弹出浏览器窗口（图形界面，便于实时观察画面）")
+        try:
+            choice_hl = input(f"请输入选项 [1/2] (直接回车默认 [{default_hl}]): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice_hl = ""
+        if choice_hl == "2":
+            cfg["headless"] = False
+        elif choice_hl == "1":
+            cfg["headless"] = True
+        else:
+            cfg["headless"] = saved_headless
+        save_config(cfg)
+    else:
+        cfg["headless"] = False
 
     try:
         run_study(course_url, args.start, cfg)

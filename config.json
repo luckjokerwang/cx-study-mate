@@ -12,7 +12,8 @@
   },
   "notification": {
     "enabled": true,
-    "popup": true
+    "popup": true,
+    "persistent": true
   },
-  "headless": false
+  "headless": true
 }
