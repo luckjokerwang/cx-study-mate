@@ -39,7 +39,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
@@ -862,12 +862,152 @@ def clean_question_text(q):
     # 移除前导题号，如 "1." 或 "12、"
     q = re.sub(r'^[0-9]+[、. ]*', '', q)
     # 移除常见题型标签前缀，如 【单选题】、[多选题]、(判断题)
-    q = re.sub(r'^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题)[】\])）]?', '', q)
-    # 规范化空填空括号，保留带有实体区分内容的括号（如“（一）”、“（2023年）”等）
+    q = re.sub(r'^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题|名词解释|论述题|计算题|问答题)[】\])）]?', '', q)
+    # 移除分值后缀，如 "（5.0分）" 或 "(5分)"
+    q = re.sub(r'[\(（]\s*\d+(?:\.\d+)?\s*分\s*[\)）]', '', q)
+    # 规范化空填空括号，保留带有实体区分内容的括号
     q = re.sub(r'[（\(]\s*[）\)]', '（ ）', q)
     # 移除末尾标点和空白
     q = re.sub(r'[。？！\s]+$', '', q)
     return q.strip()
+
+TYPE_SINGLE = "0"
+TYPE_MULTI = "1"
+TYPE_FILL = "2"
+TYPE_JUDGE = "3"
+TYPE_ESSAY = "4"
+
+TYPE_NAMES = {
+    TYPE_SINGLE: "单选题",
+    TYPE_MULTI: "多选题",
+    TYPE_FILL: "填空题",
+    TYPE_JUDGE: "判断题",
+    TYPE_ESSAY: "主观题"
+}
+
+def identify_question_type(timu_loc, raw_text=""):
+    """多维度自适应识别超星各类题型 (单选/多选/判断/填空/简答)"""
+    t = raw_text or ""
+    # 1. 显式标签识别
+    if re.search(r'[【\[(（]?(?:多选题|多选)[】\])）]?', t):
+        return TYPE_MULTI
+    if re.search(r'[【\[(（]?(?:判断题|判断)[】\])）]?', t):
+        return TYPE_JUDGE
+    if re.search(r'[【\[(（]?(?:填空题|填空)[】\])）]?', t):
+        return TYPE_FILL
+    if re.search(r'[【\[(（]?(?:简答题|名词解释|论述题|计算题|问答题)[】\])）]?', t):
+        return TYPE_ESSAY
+    if re.search(r'[【\[(（]?(?:单选题|单选)[】\])）]?', t):
+        return TYPE_SINGLE
+
+    # 2. 检查 DOM 隐藏 input[name*="type"] / [answertype]
+    try:
+        type_input = timu_loc.locator('input[name*="type"], input[name*="answertype"]').first
+        if type_input.count() > 0:
+            val = str(type_input.get_attribute("value") or "").strip()
+            if val == "0": return TYPE_SINGLE
+            if val == "1": return TYPE_MULTI
+            if val == "3": return TYPE_JUDGE
+            if val == "2": return TYPE_FILL
+            if val in ["4", "5", "6", "7", "9"]: return TYPE_ESSAY
+    except Exception:
+        pass
+
+    # 3. 检查 DOM 控件特征
+    try:
+        if timu_loc.locator('input[type="checkbox"], .check_answer_dx, .num_option_dx').count() > 0:
+            return TYPE_MULTI
+
+        if timu_loc.locator('.num_option[data="true"], .num_option[data="false"], input[value="true"], input[value="false"]').count() > 0:
+            return TYPE_JUDGE
+
+        opts = timu_loc.locator('ul li, .answerBg, .answer_p').all()
+        if len(opts) == 2:
+            all_opt_text = " ".join([o.inner_text() for o in opts])
+            if any(k in all_opt_text for k in ["对", "错", "正确", "错误", "√", "×", "True", "False"]):
+                return TYPE_JUDGE
+
+        if timu_loc.locator('input[type="radio"], .check_answer, .num_option').count() > 0:
+            return TYPE_SINGLE
+
+        textareas = timu_loc.locator('textarea, input[type="text"]').all()
+        if textareas:
+            if len(textareas) > 1 or '（ ）' in t or '空' in t:
+                return TYPE_FILL
+            return TYPE_ESSAY
+    except Exception:
+        pass
+
+    return TYPE_SINGLE
+
+def extract_timu_data(timu_loc, decode_fn):
+    """从单个题目 DOM 容器中提取标准题干、选项及控件信息"""
+    title_selectors = [
+        '.Zy_TItle .clearfix',
+        '.clearfix .fontLabel',
+        '.mark_name',
+        '.TiMu_title',
+        '.colorDeep',
+        '.Zy_TItle',
+        '[class*="TItle"]'
+    ]
+    raw_title = ""
+    for sel in title_selectors:
+        loc = timu_loc.locator(sel).first
+        if loc.count() > 0:
+            raw_title = loc.inner_text().strip()
+            if raw_title:
+                break
+    if not raw_title:
+        raw_title = timu_loc.inner_text().split('\n')[0].strip()
+
+    decoded_title = decode_fn(raw_title)
+    cleaned_title = clean_question_text(decoded_title)
+    q_type = identify_question_type(timu_loc, raw_title)
+
+    opt_selectors = [
+        'ul li',
+        '.textDIV',
+        '.answer_p',
+        '.ans-videoquiz-opt li',
+        '.answerBg .textDIV',
+        '.answerBg'
+    ]
+    opt_elements = []
+    for o_sel in opt_selectors:
+        found = timu_loc.locator(o_sel).all()
+        if found:
+            opt_elements = found
+            break
+
+    options = []
+    for idx, opt_el in enumerate(opt_elements):
+        raw_opt = opt_el.inner_text().strip()
+        decoded_opt = decode_fn(raw_opt)
+
+        num_span = opt_el.locator('.num_option, .num_option_dx, .num_option_pd').first
+        if num_span.count() > 0:
+            opt_key = num_span.inner_text().strip().rstrip('、. ')
+        else:
+            m = re.match(r'^([A-Za-z0-9√×对错]+)[、. ]*', decoded_opt)
+            opt_key = m.group(1) if m else chr(ord('A') + idx)
+
+        opt_text = re.sub(r'^[A-Za-z0-9√×对错]+[、. ]*', '', decoded_opt).strip()
+        options.append({
+            "index": idx,
+            "key": opt_key.upper(),
+            "text": opt_text or decoded_opt,
+            "raw": decoded_opt,
+            "locator": opt_el
+        })
+
+    return {
+        "raw_title": raw_title,
+        "title": cleaned_title or decoded_title,
+        "type": q_type,
+        "type_name": TYPE_NAMES.get(q_type, "单选题"),
+        "options": options
+    }
 
 def query_tiku_api(question, tiku_cfg=None):
     """优先请求用户配置的私有/自定义题库，若未配置或未命中则回退至公开免费接口"""
@@ -926,8 +1066,8 @@ def query_public_tiku(question):
         pass
     return None
 
-def query_ai_for_question(title, opt_texts, ai_cfg):
-    """通用 AI 答题请求封装，供随堂测验与章节测验复用"""
+def query_ai_for_question(title, opt_texts, ai_cfg=None, q_type=TYPE_SINGLE):
+    """按题型定制针对性 Prompt 的通用 AI 答题请求封装"""
     if not ai_cfg or not ai_cfg.get("api_key"):
         return None
     api_key = str(ai_cfg["api_key"]).strip()
@@ -937,7 +1077,17 @@ def query_ai_for_question(title, opt_texts, ai_cfg):
     model = ai_cfg.get("model", "deepseek-chat")
 
     formatted_opts = "\n".join(opt_texts) if isinstance(opt_texts, list) else str(opt_texts)
-    prompt = f"请为以下大学网课题目选择正确答案，严格只输出选项内容或字母（如 A 或 错误 或 A,B）：\n题目：{title}\n选项：\n{formatted_opts}"
+    if q_type == TYPE_SINGLE:
+        prompt = f"请为以下大学网课单选题选择唯一正确答案，严格只输出选项字母或对应内容（例如 A）：\n题目：{title}\n选项：\n{formatted_opts}"
+    elif q_type == TYPE_MULTI:
+        prompt = f"请为以下大学网课多选题选择所有正确答案，严格只输出选项字母组合或内容（例如 A,B,C）：\n题目：{title}\n选项：\n{formatted_opts}"
+    elif q_type == TYPE_JUDGE:
+        prompt = f"请为以下大学网课判断题判断对错，严格只输出“正确”或“错误”：\n题目：{title}"
+    elif q_type == TYPE_FILL:
+        prompt = f"请为以下大学网课填空题作答，若有多个空请用 # 分隔，严格只输出答案内容：\n题目：{title}"
+    else:
+        prompt = f"请为以下大学网课题目提供精炼准确的解答草稿：\n题目：{title}"
+
     try:
         req_data = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}).encode("utf-8")
         req = urllib.request.Request(f"{base_url}/chat/completions", data=req_data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
@@ -948,6 +1098,148 @@ def query_ai_for_question(title, opt_texts, ai_cfg):
         log(f"      ⚠️ AI 请求失败: {e}")
         return None
 
+def fill_answer_to_dom(work_frame, timu_loc, q_type, answer_str, options):
+    """根据题型和题库/AI 答案，智能填涂超星 DOM 控件"""
+    if not answer_str:
+        return False
+    ans_str = str(answer_str).strip()
+
+    # 1. 单选题填涂
+    if q_type == TYPE_SINGLE:
+        target_idx = match_option_index(ans_str, options)
+        if target_idx >= 0 and target_idx < len(options):
+            target = options[target_idx]
+            try:
+                # 优先操作原生单选框控件
+                radio = target["locator"].locator('input[type="radio"]').first
+                if radio.count() > 0:
+                    try: radio.check(); return True
+                    except Exception: radio.click(); return True
+
+                clickable = target["locator"].locator('.answerBg, .num_option, a, label').first
+                if clickable.count() > 0:
+                    clickable.click()
+                else:
+                    target["locator"].click()
+                return True
+            except Exception:
+                try: target["locator"].click(); return True
+                except Exception: pass
+        return False
+
+    # 2. 判断题填涂
+    elif q_type == TYPE_JUDGE:
+        is_true = bool(re.search(r'(正确|对|true|是|√|T|ri)', ans_str, re.I))
+        is_false = bool(re.search(r'(错误|错|false|否|×|F|wr)', ans_str, re.I))
+        if is_true:
+            try:
+                btn = timu_loc.locator('.num_option[data="true"], input[value="true"]').first
+                if btn.count() > 0: btn.click(); return True
+            except Exception: pass
+            for o in options:
+                if any(k in o["raw"] for k in ["正确", "对", "√", "True", "true"]):
+                    try: o["locator"].click(); return True
+                    except Exception: pass
+            if options:
+                try: options[0]["locator"].click(); return True
+                except Exception: pass
+        elif is_false:
+            try:
+                btn = timu_loc.locator('.num_option[data="false"], input[value="false"]').first
+                if btn.count() > 0: btn.click(); return True
+            except Exception: pass
+            for o in options:
+                if any(k in o["raw"] for k in ["错误", "错", "×", "False", "false"]):
+                    try: o["locator"].click(); return True
+                    except Exception: pass
+            if len(options) > 1:
+                try: options[1]["locator"].click(); return True
+                except Exception: pass
+        return False
+
+    # 3. 多选题填涂
+    elif q_type == TYPE_MULTI:
+        matched_indices = set()
+        letters = re.findall(r'[A-Za-z]', ans_str.upper())
+        if letters and all(ord(l) - ord('A') < len(options) for l in letters):
+            for l in letters:
+                matched_indices.add(ord(l) - ord('A'))
+        else:
+            ans_items = [a.strip() for a in re.split(r'[#;,/\n]', ans_str) if a.strip()]
+            for item in ans_items:
+                idx = match_option_index(item, options)
+                if idx >= 0:
+                    matched_indices.add(idx)
+
+        if not matched_indices and options:
+            return False
+
+        filled_any = False
+        for idx in matched_indices:
+            if idx < len(options):
+                opt = options[idx]
+                try:
+                    cb = opt["locator"].locator('input[type="checkbox"]').first
+                    if cb.count() > 0:
+                        try:
+                            if not cb.is_checked(): cb.check()
+                            filled_any = True
+                        except Exception:
+                            cb.click()
+                            filled_any = True
+                    else:
+                        opt["locator"].click()
+                        filled_any = True
+                except Exception:
+                    try: opt["locator"].click(); filled_any = True
+                    except Exception: pass
+        return filled_any
+
+    # 4. 填空题填涂
+    elif q_type == TYPE_FILL:
+        parts = [p.strip() for p in re.split(r'[#\n|]|第\d+空[:：]', ans_str) if p.strip()]
+        if not parts:
+            parts = [ans_str]
+
+        inputs = timu_loc.locator('textarea, input[type="text"]').all()
+        if not inputs:
+            return False
+
+        for i, val in enumerate(parts):
+            if i < len(inputs):
+                inp = inputs[i]
+                try:
+                    inp.fill(val)
+                    name = inp.get_attribute("name")
+                    if name:
+                        work_frame.evaluate("""({name, content}) => {
+                            if (window.UE && window.UE.getEditor) {
+                                try { window.UE.getEditor(name).setContent(content); } catch(e){}
+                            }
+                        }""", {"name": name, "content": val})
+                except Exception:
+                    pass
+        return True
+
+    # 5. 简答题/主观题填涂
+    elif q_type == TYPE_ESSAY:
+        textarea = timu_loc.locator('textarea').first
+        if textarea.count() > 0:
+            try:
+                textarea.fill(ans_str)
+                name = textarea.get_attribute("name")
+                if name:
+                    work_frame.evaluate("""({name, content}) => {
+                        if (window.UE && window.UE.getEditor) {
+                            try { window.UE.getEditor(name).setContent(content); } catch(e){}
+                        }
+                    }""", {"name": name, "content": ans_str})
+                return True
+            except Exception:
+                pass
+        return False
+
+    return False
 def match_option_index(answer_str, options):
     """根据题库/AI 答案字符串，在选项列表中匹配最佳选项索引 (0-based)"""
     if not answer_str or not options:
@@ -1002,24 +1294,40 @@ def match_option_index(answer_str, options):
 
     return -1
 def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
-    """解密字体、查题/AI辅助答题并自动点击【暂存草稿】"""
+    """解密字体、全题型智能识别与作答，并自动安全【暂存草稿】"""
     from fontTools.ttLib.ttFont import TTFont
 
-    if not os.path.exists(FONT_MAP_FILE):
-        log("   ⚠️ 未找到 font_map_table.json 字体解密表，跳过自动答题。")
+    # 1. 递归检查嵌套 iframe (兼容 /ananas/modules/work/index.html -> /work/doHomeWorkNew)
+    timus = work_frame.locator('.TiMu, .questionLi, .mark_table').all()
+    if len(timus) == 0 and hasattr(work_frame, 'child_frames') and work_frame.child_frames:
+        for cf in work_frame.child_frames:
+            solve_quiz(cf, mode=mode, ai_cfg=ai_cfg, tiku_cfg=tiku_cfg)
         return
 
-    with open(FONT_MAP_FILE, "r", encoding="utf-8") as f:
-        char_map = json.load(f)
+    if not timus:
+        return
+
+    # 2. 字体解密准备 (离线字模表 + TTFont 动态解析)
+    char_map = {}
+    if os.path.exists(FONT_MAP_FILE):
+        try:
+            with open(FONT_MAP_FILE, "r", encoding="utf-8") as f:
+                char_map = json.load(f)
+        except Exception:
+            pass
     hash_map = {h: c for c, h in char_map.items()}
 
-    font_b64 = work_frame.evaluate("""() => {
-        for (let s of document.querySelectorAll('style')) {
-            let m = s.textContent.match(/base64,([A-Za-z0-9+/=]+)/);
-            if (m) return m[1];
-        }
-        return null;
-    }""")
+    font_b64 = None
+    try:
+        font_b64 = work_frame.evaluate("""() => {
+            for (let s of document.querySelectorAll('style')) {
+                let m = s.textContent.match(/base64,([A-Za-z0-9+/=]+)/);
+                if (m) return m[1];
+            }
+            return null;
+        }""")
+    except Exception:
+        pass
 
     font_hashmap = {}
     if font_b64:
@@ -1034,6 +1342,8 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
             pass
 
     def decode_text(enc_text):
+        if not enc_text:
+            return ""
         res = []
         for ch in enc_text:
             cname = f'uni{ord(ch):X}'
@@ -1044,66 +1354,68 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
                     try:
                         res.append(chr(int(orig_code[3:], 16)))
                         continue
-                    except: pass
+                    except Exception: pass
             res.append(ch)
         return ''.join(res).translate(KX_RADICALS_TAB)
 
-    timus = work_frame.locator('.TiMu').all()
-    log(f"   📝 检测到测验包含 {len(timus)} 道题，正在进行智能匹配解答 (模式: {mode})...")
+    log(f"   📝 检测到测验包含 {len(timus)} 道题，正在进行全题型智能识别与解答 (模式: {mode})...")
 
     matched_count = 0
     for idx, timu in enumerate(timus):
-        raw_title = timu.locator('.Zy_TItle .clearfix').inner_text()
-        title = decode_text(raw_title).strip()
-        opts = timu.locator('ul li').all()
+        try:
+            data = extract_timu_data(timu, decode_text)
+            q_title = data["title"]
+            q_type = data["type"]
+            q_name = data["type_name"]
+            options = data["options"]
 
-        answer_str = None
-        # 1. 优先尝试公共题库
-        if mode == "tiku":
-            answer_str = query_tiku_api(title, tiku_cfg=tiku_cfg)
-            if answer_str:
-                log(f"      [题 {idx+1}] 题库命中标准答案: {answer_str}")
-            else:
-                log(f"      [题 {idx+1}] 题库未收录，保留空白供人工复核。")
+            disp_title = q_title if len(q_title) <= 28 else q_title[:28] + "..."
+            log(f"      [题 {idx+1}/{len(timus)}] [{q_name}] 题干: 《{disp_title}》")
 
-        # 2. 如果是 AI 模式或题库未命中且配置了 AI
-        if not answer_str and (mode == "ai" or (ai_cfg and ai_cfg.get("api_key"))):
-            opt_texts = [f"{o.locator('.num_option, .num_option_dx').inner_text().strip()}. {decode_text(o.inner_text()).strip()}" for o in opts]
-            answer_str = query_ai_for_question(title, opt_texts, ai_cfg)
-            if answer_str:
-                log(f"      [题 {idx+1}] AI 解答: {answer_str}")
+            answer_str = None
+            # 1. 优先公共题库
+            if mode == "tiku":
+                answer_str = query_tiku_api(q_title, tiku_cfg=tiku_cfg)
+                if answer_str:
+                    log(f"         🎯 题库命中: {answer_str}")
+                else:
+                    log(f"         ⚠️ 题库未收录，尝试 AI 辅助或保留空白。")
 
-        if not answer_str:
-            continue
+            # 2. 题库未命中且启用 AI
+            if not answer_str and (mode == "ai" or (ai_cfg and ai_cfg.get("api_key"))):
+                opt_strings = [f"{o['key']}. {o['text']}" for o in options]
+                answer_str = query_ai_for_question(q_title, opt_strings, ai_cfg=ai_cfg, q_type=q_type)
+                if answer_str:
+                    log(f"         🤖 AI 辅助解答: {answer_str}")
 
-        matched_count += 1
-        # 判断题匹配
-        if re.search(r'(错误|错|false|否|×)', answer_str, re.I):
-            try:
-                timu.locator('.num_option[data="false"], input[value="false"]').first.click()
-            except Exception: pass
-        elif re.search(r'(正确|对|true|是|√)', answer_str, re.I):
-            try:
-                timu.locator('.num_option[data="true"], input[value="true"]').first.click()
-            except Exception: pass
-        else:
-            # 文本比对匹配
-            ans_parts = [a.strip() for a in re.split(r'[#;,/ ]', answer_str) if a.strip()]
-            for o in opts:
-                opt_txt = decode_text(o.inner_text()).strip()
-                span = o.locator('.num_option, .num_option_dx')
-                opt_key = (span.inner_text().strip() if span.count() > 0 else '').upper()
-                for ans_item in ans_parts:
-                    if (ans_item == opt_txt) or (len(ans_item) > 1 and ans_item in opt_txt) or (opt_key and opt_key == ans_item.upper()):
-                        try:
-                            o.click()
-                        except Exception: pass
+            if not answer_str:
+                continue
 
-    # 核心安全操作：只点击“暂存”，绝不自动提交！
+            filled = fill_answer_to_dom(work_frame, timu, q_type, answer_str, options)
+            if filled:
+                matched_count += 1
+                log(f"         ✍️ 已成功填涂选项/草稿")
+        except Exception as e:
+            log(f"      ⚠️ [题 {idx+1}] 解析作答异常: {e}")
+
+    # 核心安全操作：只点击“暂存草稿”，绝不自动提交！
     time.sleep(1)
-    work_frame.evaluate("() => { if (window.noSubmit) window.noSubmit(); }")
-    log(f"   ✅【测验草稿暂存完成】已成功填涂 {matched_count}/{len(timus)} 题并暂存草稿！请在网页端核对后手动提交。")
-
+    try:
+        work_frame.evaluate("""() => {
+            if (typeof window.noSubmit === 'function') {
+                try { window.noSubmit(); return; } catch(e){}
+            }
+            const btns = Array.from(document.querySelectorAll('a, button, span, input[type="button"]'));
+            for (const b of btns) {
+                const txt = (b.innerText || b.value || '').trim();
+                if (['暂存', '保存草稿', '保存'].includes(txt)) {
+                    try { b.click(); return; } catch(e){}
+                }
+            }
+        }""")
+    except Exception:
+        pass
+    log(f"   ✅【测验草稿暂存完成】已成功识别并填涂 {matched_count}/{len(timus)} 题并暂存草稿！请在网页端核对后手动提交。")
 def extract_chapters_from_page(page):
     """自适应提取页面中所有的章节信息"""
     return page.evaluate("""() => {
@@ -1171,11 +1483,15 @@ def process_current_tab_tasks(page, cfg):
     if page.is_closed():
         return
     # 2. 章节测验/作业处理
-    quiz_frames = [f for f in page.frames if 'doHomeWorkNew' in f.url]
+    quiz_frames = [
+        f for f in page.frames
+        if any(k in f.url for k in ['doHomeWorkNew', 'dowork', 'selectWorkQuestion', 'work/index.html', 'work/question'])
+    ]
     if quiz_frames:
         q_mode = cfg.get("quiz_mode", "skip")
         if q_mode in ["tiku", "ai"]:
-            solve_quiz(quiz_frames[0], mode=q_mode, ai_cfg=cfg.get("ai_config", {}), tiku_cfg=cfg.get("tiku_config", {}))
+            for qf in quiz_frames:
+                solve_quiz(qf, mode=q_mode, ai_cfg=cfg.get("ai_config", {}), tiku_cfg=cfg.get("tiku_config", {}))
         else:
             log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
