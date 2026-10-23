@@ -31,6 +31,7 @@ import argparse
 import urllib.request
 import urllib.parse
 import math
+import random
 import shutil
 import subprocess
 import platform
@@ -639,7 +640,7 @@ def play_video_frame(page, vf, video_idx, total_videos, cfg=None):
 
                 # 1. 优先题库查询
                 try:
-                    ans = query_tiku_api(clean_t, tiku_cfg=tiku_cfg)
+                    ans = query_tiku_api(clean_t, tiku_cfg=tiku_cfg, q_type=TYPE_SINGLE)
                 except Exception:
                     ans = None
 
@@ -1027,62 +1028,139 @@ def extract_timu_data(timu_loc, decode_fn):
         "options": options
     }
 
-def query_tiku_api(question, tiku_cfg=None):
-    """优先请求用户配置的私有/自定义题库，若未配置或未命中则回退至公开免费接口"""
+_TIKU_HEALTH = {}
+_TIKU_BAD_KEYWORDS = (
+    "未搜索到", "未收录", "暂无答案", "无答案", "查无此题", "付费题库",
+    "请填写", "授权码", "秘钥", "密钥", "余额", "积分不足", "请登录",
+    "公众号", "扫码", "李恒雅", "睡觉", "叛逆",
+)
+
+def _tiku_type_int(q_type):
+    try:
+        return int(q_type)
+    except (TypeError, ValueError):
+        return 0
+
+def _tiku_post_json(url, payload, headers=None, timeout=6):
+    req_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    }
+    if headers:
+        req_headers.update(headers)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _valid_tiku_answer(raw):
+    """清洗题库返回值，过滤广告、授权提示与空答案"""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("answer") or raw.get("result") or raw.get("data")
+    text = re.sub(r"<[^>]+>", "", str(raw)).replace("&nbsp;", " ").strip()
+    text = re.sub(r"^(?:正确答案|参考答案|答案)\s*[:：]\s*", "", text)
+    text = text.replace("\r", "\n").strip()
+    if not text or len(text) > 500:
+        return None
+    if any(k in text for k in _TIKU_BAD_KEYWORDS):
+        return None
+    return text
+
+def _tiku_custom(cq, q_type, cfg):
+    url = (cfg.get("api_url") or "").strip()
+    if not url:
+        return None
+    token = (cfg.get("token") or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    res = _tiku_post_json(url, {"question": cq, "token": token, "type": _tiku_type_int(q_type)}, headers)
+    return _valid_tiku_answer(res.get("data") if res.get("data") is not None else (res.get("answer") or res.get("result")))
+
+def _tiku_tikuhai(cq, q_type, cfg):
+    key = (cfg.get("thtoken") or "").strip()
+    res = _tiku_post_json("http://api.tikuhai.com/search", {
+        "key": key,
+        "question": cq,
+        "type": _tiku_type_int(q_type),
+    })
+    if res.get("code") == -1:
+        return None
+    data = res.get("data") or {}
+    return _valid_tiku_answer(data.get("answer") if isinstance(data, dict) else data)
+
+def _tiku_yizhi(cq, q_type, cfg):
+    ip = ".".join(str(random.randint(1, 254)) for _ in range(4))
+    res = _tiku_post_json("http://cx.icodef.com/wyn-nb?v=4", {"question": cq}, {
+        "Authorization": (cfg.get("yztoken") or "").strip(),
+        "X-Forwarded-For": ip,
+        "X-Real-IP": ip,
+    })
+    if res.get("code") != 1:
+        return None
+    return _valid_tiku_answer(res.get("data"))
+
+def _tiku_muketool(cq, q_type, cfg):
+    res = _tiku_post_json("https://api.muketool.com/cx/v2/query", {
+        "question": cq,
+        "type": _tiku_type_int(q_type),
+    })
+    if res.get("code") != 1:
+        return None
+    return _valid_tiku_answer(res.get("data"))
+
+def _tiku_enncy(cq, q_type, cfg):
+    token = (cfg.get("enncy_token") or "").strip()
+    if not token:
+        return None
+    res = _tiku_post_json("https://tk.enncy.cn/query", {"token": token, "title": cq})
+    if res.get("code") != 1:
+        return None
+    return _valid_tiku_answer(res.get("data"))
+
+def query_tiku_api(question, tiku_cfg=None, q_type=None):
+    """多源并发题库查询：自定义 → 题库海 → 一之 → free4 → 言溪，首个有效答案即用"""
     cq = clean_question_text(question)
     if not cq:
         return None
+    cfg = tiku_cfg or {}
 
-    # 1. 优先尝试用户自定义题库 (config.json 中的 tiku_config)
-    if tiku_cfg and tiku_cfg.get("api_url"):
-        api_url = tiku_cfg["api_url"].strip()
-        token = tiku_cfg.get("token", "").strip()
+    providers = []
+    if (cfg.get("api_url") or "").strip():
+        providers.append(("自定义", _tiku_custom))
+    providers.append(("题库海", _tiku_tikuhai))
+    providers.append(("一之", _tiku_yizhi))
+    providers.append(("free4", _tiku_muketool))
+    if (cfg.get("enncy_token") or "").strip():
+        providers.append(("言溪", _tiku_enncy))
+
+    active = [(name, fn) for name, fn in providers if _TIKU_HEALTH.get(name, 0) < 3]
+    if not active:
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=min(4, len(active))) as executor:
+        futures = {executor.submit(fn, cq, q_type, cfg): name for name, fn in active}
         try:
-            req_data = json.dumps({"question": cq, "token": token}).encode("utf-8")
-            headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            req = urllib.request.Request(api_url, data=req_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                ans = res.get("data") if res.get("data") is not None else (res.get("answer") or res.get("result"))
-                if ans:
-                    ans_str = str(ans).strip()
-                    if ans_str and not any(k in ans_str for k in ["未搜索到", "未收录", "李恒雅正在睡觉", "查无此题"]):
-                        return ans_str
+            for future in as_completed(futures, timeout=8):
+                name = futures[future]
+                try:
+                    answer = future.result()
+                except Exception:
+                    answer = None
+                if answer:
+                    _TIKU_HEALTH[name] = 0
+                    log(f"         🎯 题库命中 [{name}]: {answer[:40]}")
+                    return answer
+                _TIKU_HEALTH[name] = _TIKU_HEALTH.get(name, 0) + 1
         except Exception:
             pass
-
-    # 2. 回退到公开免费题库
-    return query_public_tiku(cq)
-
-def query_public_tiku(question):
-    """请求去商业化的公开免费题库接口"""
-    cq = clean_question_text(question)
-    if not cq:
-        return None
-    url = "http://cx.icodef.com/wyn-nb?v=4"
-    data = json.dumps({"question": cq}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "X-Forwarded-For": "114.114.114.114"
-        }
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            if res.get("code") == 1:
-                ans = str(res.get("data", "")).strip()
-                # 过滤第三方广告与无答案提示
-                if not any(k in ans for k in ["叛逆", "公众号", "李恒雅", "一之", "付费", "扫码", "未搜索到", "睡觉觉"]):
-                    return ans
-    except Exception:
-        pass
     return None
+
+def query_public_tiku(question, q_type=None):
+    """兼容旧调用：直接走公开题库链路"""
+    return query_tiku_api(question, q_type=q_type)
 
 def query_ai_for_question(title, opt_texts, ai_cfg=None, q_type=TYPE_SINGLE):
     """按题型定制针对性 Prompt 的通用 AI 答题请求封装"""
@@ -1320,15 +1398,16 @@ def record_quiz_stat(bucket, title, type_name, **extra):
     entry.update(extra)
     bucket.append(entry)
 
-def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
-    """解密字体、全题型智能识别与作答，并自动安全【暂存草稿】"""
+def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None, auto_submit=False, min_accuracy=0.8):
+    """解密字体、全题型智能识别与作答，默认仅暂存草稿，可配置阈值自动提交"""
     from fontTools.ttLib.ttFont import TTFont
 
     # 1. 递归检查嵌套 iframe (兼容 /ananas/modules/work/index.html -> /work/doHomeWorkNew)
     timus = work_frame.locator('.TiMu, .questionLi, .mark_table').all()
     if len(timus) == 0 and hasattr(work_frame, 'child_frames') and work_frame.child_frames:
         for cf in work_frame.child_frames:
-            solve_quiz(cf, mode=mode, ai_cfg=ai_cfg, tiku_cfg=tiku_cfg)
+            solve_quiz(cf, mode=mode, ai_cfg=ai_cfg, tiku_cfg=tiku_cfg,
+                       auto_submit=auto_submit, min_accuracy=min_accuracy)
         return
 
     if not timus:
@@ -1402,7 +1481,7 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
             answer_str = None
             # 1. 优先公共题库
             if mode == "tiku":
-                answer_str = query_tiku_api(q_title, tiku_cfg=tiku_cfg)
+                answer_str = query_tiku_api(q_title, tiku_cfg=tiku_cfg, q_type=q_type)
                 if answer_str:
                     log(f"         🎯 题库命中: {answer_str}")
                 else:
@@ -1430,24 +1509,46 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
         except Exception as e:
             log(f"      ⚠️ [题 {idx+1}] 解析作答异常: {e}")
 
-    # 核心安全操作：只点击“暂存草稿”，绝不自动提交！
-    time.sleep(1)
-    try:
-        work_frame.evaluate("""() => {
-            if (typeof window.noSubmit === 'function') {
-                try { window.noSubmit(); return; } catch(e){}
-            }
-            const btns = Array.from(document.querySelectorAll('a, button, span, input[type="button"]'));
-            for (const b of btns) {
-                const txt = (b.innerText || b.value || '').trim();
-                if (['暂存', '保存草稿', '保存'].includes(txt)) {
-                    try { b.click(); return; } catch(e){}
+    # 提交策略：默认只暂存草稿；开启 auto_submit 且正确率达标时才自动提交
+    total_q = len(timus)
+    accuracy = (matched_count / total_q) if total_q else 0.0
+    submitted = False
+    if auto_submit and total_q > 0 and accuracy >= min_accuracy:
+        try:
+            work_frame.evaluate("""() => {
+                if (typeof window.btnBlueSubmit === 'function') { window.btnBlueSubmit(); }
+            }""")
+            time.sleep(2)
+            work_frame.evaluate("""() => {
+                if (typeof window.submitCheckTimes === 'function') { window.submitCheckTimes(); }
+            }""")
+            submitted = True
+            log(f"   ✅【自动提交】正确率 {matched_count}/{total_q} 达到阈值 {min_accuracy:.0%}，已提交。")
+        except Exception as e:
+            log(f"   ⚠️ 自动提交失败，回退为暂存草稿: {e}")
+    elif auto_submit and total_q > 0:
+        log(f"   ⚠️ 正确率 {matched_count}/{total_q} 低于阈值 {min_accuracy:.0%}，本次仅暂存草稿。")
+
+    if not submitted:
+        time.sleep(1)
+        try:
+            work_frame.evaluate("""() => {
+                if (typeof window.noSubmit === 'function') {
+                    try { window.noSubmit(); return; } catch(e){}
                 }
-            }
-        }""")
-    except Exception:
-        pass
-    log(f"   ✅【测验草稿暂存完成】已成功识别并填涂 {matched_count}/{len(timus)} 题并暂存草稿！请在网页端核对后手动提交。")
+                const btns = Array.from(document.querySelectorAll('a, button, span, input[type="button"]'));
+                for (const b of btns) {
+                    const txt = (b.innerText || b.value || '').trim();
+                    if (['暂存', '保存草稿', '保存'].includes(txt)) {
+                        try { b.click(); return; } catch(e){}
+                    }
+                }
+            }""")
+        except Exception:
+            pass
+        log(f"   ✅【测验草稿暂存完成】已成功识别并填涂 {matched_count}/{total_q} 题并暂存草稿！请在网页端核对后手动提交。")
+
+
 def extract_chapters_from_page(page):
     """自适应提取页面中所有的章节信息"""
     return page.evaluate("""() => {
@@ -1639,7 +1740,14 @@ def process_current_tab_tasks(page, cfg):
         q_mode = cfg.get("quiz_mode", "skip")
         if q_mode in ["tiku", "ai"]:
             for qf in quiz_frames:
-                solve_quiz(qf, mode=q_mode, ai_cfg=cfg.get("ai_config", {}), tiku_cfg=cfg.get("tiku_config", {}))
+                solve_quiz(
+                    qf,
+                    mode=q_mode,
+                    ai_cfg=cfg.get("ai_config", {}),
+                    tiku_cfg=cfg.get("tiku_config", {}),
+                    auto_submit=bool(cfg.get("auto_submit", False)),
+                    min_accuracy=float(cfg.get("min_accuracy", 0.8) or 0.8),
+                )
         else:
             log(f"   📝 [测验安全跳过] 当前标签包含单元测验，已按设定安全跳过（保留手动完成）。")
 
@@ -1665,6 +1773,7 @@ def run_study(url, start_chapter=None, cfg=None):
     # 每次运行前重置本轮测验统计，避免重复调用时累加
     GLOBAL_ANSWERED_QUIZZES.clear()
     GLOBAL_UNANSWERED_QUIZZES.clear()
+    _TIKU_HEALTH.clear()
 
     info = parse_course_url(url)
     if not info["course_id"]:
