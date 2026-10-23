@@ -1,10 +1,37 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
+
+
+class TestAiSettings(unittest.TestCase):
+    def test_env_overrides_config(self):
+        with mock.patch.dict(os.environ, {
+            "CX_AI_API_KEY": "env-key",
+            "CX_AI_BASE_URL": "http://env/v1",
+            "CX_AI_MODEL": "env-model",
+        }, clear=False):
+            key, url, model = main.get_ai_settings({
+                "api_key": "cfg-key",
+                "base_url": "http://cfg/v1",
+                "model": "cfg-model",
+            })
+        self.assertEqual((key, url, model), ("env-key", "http://env/v1", "env-model"))
+
+    def test_config_fallback(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            key, url, model = main.get_ai_settings({
+                "api_key": "cfg-key",
+                "base_url": "http://cfg/v1/",
+                "model": "cfg-model",
+            })
+        self.assertEqual(key, "cfg-key")
+        self.assertEqual(url, "http://cfg/v1")
+        self.assertEqual(model, "cfg-model")
 
 
 class TestConfigMerge(unittest.TestCase):

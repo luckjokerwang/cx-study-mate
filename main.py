@@ -40,7 +40,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.10.1"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
@@ -698,7 +698,7 @@ def play_video_frame(page, vf, video_idx, total_videos, cfg=None):
                     matched_idx = match_option_index(ans, options)
 
                 # 2. 题库未命中且配置了 AI，请求 AI 辅助
-                if matched_idx < 0 and ai_cfg.get("api_key"):
+                if matched_idx < 0 and get_ai_settings(ai_cfg)[0]:
                     opt_strings = [o.get("text", "") for o in options]
                     ai_ans = query_ai_for_question(clean_t, opt_strings, ai_cfg)
                     if ai_ans:
@@ -1211,15 +1211,19 @@ def query_public_tiku(question, q_type=None):
     """兼容旧调用：直接走公开题库链路"""
     return query_tiku_api(question, q_type=q_type)
 
+def get_ai_settings(ai_cfg=None):
+    """读取 AI 配置，环境变量优先，便于在不落盘密钥的情况下运行"""
+    cfg = ai_cfg or {}
+    api_key = os.environ.get("CX_AI_API_KEY", "").strip() or str(cfg.get("api_key", "")).strip()
+    base_url = os.environ.get("CX_AI_BASE_URL", "").strip() or str(cfg.get("base_url", "https://api.deepseek.com/v1")).strip()
+    model = os.environ.get("CX_AI_MODEL", "").strip() or str(cfg.get("model", "deepseek-chat")).strip()
+    return api_key, base_url.rstrip("/"), model
+
 def query_ai_for_question(title, opt_texts, ai_cfg=None, q_type=TYPE_SINGLE):
     """按题型定制针对性 Prompt 的通用 AI 答题请求封装"""
-    if not ai_cfg or not ai_cfg.get("api_key"):
-        return None
-    api_key = str(ai_cfg["api_key"]).strip()
+    api_key, base_url, model = get_ai_settings(ai_cfg)
     if not api_key:
         return None
-    base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1").rstrip("/")
-    model = ai_cfg.get("model", "deepseek-chat")
 
     formatted_opts = "\n".join(opt_texts) if isinstance(opt_texts, list) else str(opt_texts)
     if q_type == TYPE_SINGLE:
@@ -1537,7 +1541,7 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None, auto_submit=
                     log(f"         ⚠️ 题库未收录，尝试 AI 辅助或保留空白。")
 
             # 2. 题库未命中且启用 AI
-            if not answer_str and (mode == "ai" or (ai_cfg and ai_cfg.get("api_key"))):
+            if not answer_str and (mode == "ai" or get_ai_settings(ai_cfg)[0]):
                 opt_strings = [f"{o['key']}. {o['text']}" for o in options]
                 answer_str = query_ai_for_question(q_title, opt_strings, ai_cfg=ai_cfg, q_type=q_type)
                 if answer_str:

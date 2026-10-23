@@ -101,6 +101,25 @@ uv run main.py --url "..." --quiz-mode tiku --no-update
 - `playback_rate`：默认 `1.0`，最高限制 `2.0`；不建议超过 `1.5`，倍速越高异常特征越明显。
 - `tiku_config`：填了哪个源就用哪个，留空则自动跳过；多源会并发查询，单源失败不影响整体。
 
+### 密钥不落盘（推荐）
+
+```bash
+cp .env.local.example .env.local
+# 编辑 .env.local，填入 CX_AI_API_KEY
+./start.sh --quiz-mode ai
+```
+
+`start.sh` 会自动加载 `.env.local`（该文件已被 `.gitignore` 忽略）。直接运行 `uv run main.py` 时，也可以手动注入：
+
+```bash
+export CX_AI_API_KEY="sk-..."
+export CX_AI_BASE_URL="https://api.deepseek.com/v1"
+export CX_AI_MODEL="deepseek-chat"
+uv run main.py --quiz-mode ai
+```
+
+环境变量优先级高于 `config.json` 中的 `ai_config`，因此不必把密钥写进仓库文件。
+
 ---
 
 ## ❓ 常见问题 (FAQ)

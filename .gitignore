@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 *.db
 course_cache.json
+.env
+.env.local

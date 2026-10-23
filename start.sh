@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
+# 0. 加载本地密钥（可选，.env.local 已被 .gitignore 忽略）
+if [ -f ".env.local" ]; then
+    set -a
+    . ./.env.local
+    set +a
+fi
+
 echo "========================================================"
 echo " 🎓 超星学习助手 (Chaoxing Study Mate) - 一键启动器"
 echo "========================================================"
