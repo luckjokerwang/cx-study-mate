@@ -40,7 +40,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.10.0"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
@@ -332,6 +332,36 @@ def launch_browser(p, headless=True):
 
     return p.chromium.launch(headless=headless, args=['--disable-blink-features=AutomationControlled', '--mute-audio'])
 
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+def create_context(browser, storage_state=None):
+    """统一浏览器上下文：真实 UA、中文环境、自动化标记兼容"""
+    version = "131.0.0.0"
+    try:
+        if getattr(browser, "version", None):
+            version = browser.version
+    except Exception:
+        pass
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+    ctx = browser.new_context(
+        storage_state=storage_state,
+        user_agent=user_agent,
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
+        viewport={"width": 1440, "height": 900},
+    )
+    try:
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            if (!window.chrome) { window.chrome = { runtime: {} }; }
+        """)
+    except Exception:
+        pass
+    return ctx
+
 def ensure_login(p):
     """检查登录态，无登录态则弹出二维码扫码"""
     if os.path.exists(AUTH_FILE):
@@ -349,7 +379,7 @@ def ensure_login(p):
     log("=" * 50 + "\n")
 
     browser = launch_browser(p, headless=False)
-    context = browser.new_context()
+    context = create_context(browser)
     page = context.new_page()
 
     login_url = "https://passport2.chaoxing.com/login?fid=&newversion=true&refer=http%3A%2F%2Fi.mooc.chaoxing.com"
@@ -410,6 +440,20 @@ def play_video_frame(page, vf, video_idx, total_videos, cfg=None):
     """控制单集视频播放，监听心跳，达到 100% 结束，具备掉线强校验与看门狗"""
     is_passed = [False]
     notified_pass = [False]
+
+    playback_rate = 1.0
+    if cfg:
+        try:
+            playback_rate = float(cfg.get("playback_rate", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            playback_rate = 1.0
+    if playback_rate > 2.0:
+        log(f"   ⚠️ 配置倍速 {playback_rate}x 过高，已限制为 2.0x（不建议超过 1.5x）")
+        playback_rate = 2.0
+    if playback_rate < 0.5:
+        playback_rate = 0.5
+    if abs(playback_rate - 1.0) > 0.01:
+        log(f"   ⏩ 本视频播放倍速: {playback_rate}x")
 
     def on_response(response):
         if 'multimedia/log' in response.url:
@@ -472,6 +516,11 @@ def play_video_frame(page, vf, video_idx, total_videos, cfg=None):
         log(f"   ⚠️ 启动播放异常: {e}")
         page.remove_listener('response', on_response)
         return False
+
+    try:
+        vf.evaluate("(rate) => { const p = window.videojs ? videojs.getPlayers()['video'] : null; if (p) p.playbackRate(rate); }", playback_rate)
+    except Exception:
+        pass
 
     time.sleep(2)
     new_dur = vf.evaluate("""() => {
@@ -1785,7 +1834,7 @@ def run_study(url, start_chapter=None, cfg=None):
         auth_path = ensure_login(p)
 
         browser = launch_browser(p, headless=is_headless)
-        context = browser.new_context(storage_state=auth_path)
+        context = create_context(browser, storage_state=auth_path)
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
 
@@ -1846,7 +1895,7 @@ def run_study(url, start_chapter=None, cfg=None):
                     os.remove(AUTH_FILE)
                 auth_path = ensure_login(p)
                 browser = launch_browser(p, headless=is_headless)
-                context = browser.new_context(storage_state=auth_path)
+                context = create_context(browser, storage_state=auth_path)
                 page = context.new_page()
                 safe_goto(page, info["raw_url"], wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
