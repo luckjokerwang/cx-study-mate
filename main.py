@@ -39,10 +39,12 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COURSE_CACHE_FILE = os.path.join(BASE_DIR, "course_cache.json")
+GLOBAL_ANSWERED_QUIZZES = []
+GLOBAL_UNANSWERED_QUIZZES = []
 FONT_MAP_FILE = os.path.join(BASE_DIR, "font_map_table.json")
 VERSION_FILE = os.path.join(BASE_DIR, "version.json")
 UPDATE_MIRRORS = [
@@ -1293,6 +1295,15 @@ def match_option_index(answer_str, options):
         return best_idx
 
     return -1
+def record_quiz_stat(bucket, title, type_name, **extra):
+    """按题干+题型去重记录测验统计，避免嵌套 frame 或重复巡检造成重复计数"""
+    for item in bucket:
+        if item["title"] == title and item["type"] == type_name:
+            return
+    entry = {"title": title, "type": type_name}
+    entry.update(extra)
+    bucket.append(entry)
+
 def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
     """解密字体、全题型智能识别与作答，并自动安全【暂存草稿】"""
     from fontTools.ttLib.ttFont import TTFont
@@ -1389,12 +1400,17 @@ def solve_quiz(work_frame, mode="tiku", ai_cfg=None, tiku_cfg=None):
                     log(f"         🤖 AI 辅助解答: {answer_str}")
 
             if not answer_str:
+                record_quiz_stat(GLOBAL_UNANSWERED_QUIZZES, q_title, q_name, reason="题库/AI 未命中")
                 continue
 
             filled = fill_answer_to_dom(work_frame, timu, q_type, answer_str, options)
             if filled:
                 matched_count += 1
+                record_quiz_stat(GLOBAL_ANSWERED_QUIZZES, q_title, q_name, answer=answer_str)
                 log(f"         ✍️ 已成功填涂选项/草稿")
+            else:
+                record_quiz_stat(GLOBAL_UNANSWERED_QUIZZES, q_title, q_name, reason=f"已得答案[{answer_str}]但填涂失败")
+                log(f"         ⚠️ 已获取答案但自动填涂失败，请人工复核。")
         except Exception as e:
             log(f"      ⚠️ [题 {idx+1}] 解析作答异常: {e}")
 
@@ -1465,13 +1481,25 @@ def process_current_tab_tasks(page, cfg):
                         const cts = document.querySelectorAll('.ans-attach-ct');
                         if (cts[{idx}]) {{
                             const icon = cts[{idx}].querySelector('.ans-job-icon');
-                            return icon && (icon.getAttribute('aria-label') || '').includes('已完成');
+                            if (icon && (icon.getAttribute('aria-label') || '').includes('已完成')) return true;
+                            if (icon && icon.closest('.ans-job-finished') !== null) return true;
+                            if (cts[{idx}].classList.contains('ans-job-finished')) return true;
                         }}
                         return false;
                     }}""")
                 except Exception:
                     pass
 
+            if not is_done:
+                try:
+                    is_done = vf.evaluate("""() => {
+                        const p = window.videojs ? videojs.getPlayers()['video'] : null;
+                        if (!p) return false;
+                        if (typeof window.isUnFinishJob === 'function' && !window.isUnFinishJob()) return true;
+                        return p.ended() || (p.duration() > 0 && p.currentTime() >= p.duration() - 2.5);
+                    }""")
+                except Exception:
+                    pass
             if is_done:
                 log(f"   --> [视频 {idx + 1}/{len(video_frames)}] 此前已打卡完成，跳过。")
                 continue
@@ -1488,6 +1516,8 @@ def process_current_tab_tasks(page, cfg):
         if any(k in f.url for k in ['doHomeWorkNew', 'dowork', 'selectWorkQuestion', 'work/index.html', 'work/question'])
     ]
     if quiz_frames:
+        # 过滤掉嵌套的子 frame，避免外层递归与内层直连重复处理同一份测验
+        quiz_frames = [f for f in quiz_frames if f.parent_frame not in quiz_frames]
         q_mode = cfg.get("quiz_mode", "skip")
         if q_mode in ["tiku", "ai"]:
             for qf in quiz_frames:
@@ -1513,6 +1543,10 @@ def safe_goto(page, url, wait_until="domcontentloaded", timeout=45000, max_retri
 def run_study(url, start_chapter=None, cfg=None):
     if not cfg:
         cfg = load_config()
+
+    # 每次运行前重置本轮测验统计，避免重复调用时累加
+    GLOBAL_ANSWERED_QUIZZES.clear()
+    GLOBAL_UNANSWERED_QUIZZES.clear()
 
     info = parse_course_url(url)
     if not info["course_id"]:
@@ -1692,21 +1726,34 @@ def run_study(url, start_chapter=None, cfg=None):
             "is_finished": True,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
+        total_q = len(GLOBAL_ANSWERED_QUIZZES) + len(GLOBAL_UNANSWERED_QUIZZES)
+        if total_q > 0:
+            print("\n" + "=" * 55)
+            print(f"📊【章节测验统计汇总】共巡检检测到 {total_q} 道测验题：")
+            print(f"   ✅ 成功匹配并暂存草稿: {len(GLOBAL_ANSWERED_QUIZZES)} 道")
+            print(f"   ⚠️ 未自动填涂（保留空白）: {len(GLOBAL_UNANSWERED_QUIZZES)} 道")
+            if GLOBAL_UNANSWERED_QUIZZES:
+                print("   --------------------------------------------------")
+                print("   以下为需人工复核的题目列表:")
+                for i, uq in enumerate(GLOBAL_UNANSWERED_QUIZZES, 1):
+                    print(f"   [{i}] [{uq['type']}] {uq['title']}  ({uq.get('reason', '未命中')})")
+            print("=" * 55)
         notify_user("超星学习助手 - 学习任务圆满完成", f"恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学习完成！", is_popup=True, block=True)
         browser.close()
         print("\n" + "=" * 55)
         print(f"🎉 恭喜！课程《{course_name}》共 {len(chapters)} 个小节已全部学完打卡！")
         print("=" * 55)
-        try:
-            input("\n请按 [回车] 键安全退出程序...")
-        except (EOFError, KeyboardInterrupt):
-            pass
+        if sys.stdin.isatty():
+            try:
+                input("\n请按 [回车] 键安全退出程序...")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 def main():
     parser = argparse.ArgumentParser(description="超星泛雅/学习通全自动跨平台挂课助手")
     parser.add_argument("--url", type=str, help="网课主页或学习页面完整 URL")
     parser.add_argument("--start", type=str, default=None, help="起始小节名称或ID (可选)")
-    parser.add_argument("--quiz-mode", type=str, choices=["skip", "ai"], default=None, help="测验处理模式: skip(跳过) / ai(AI答题暂存)")
+    parser.add_argument("--quiz-mode", type=str, choices=["skip", "tiku", "ai"], default=None, help="测验处理模式: skip(跳过) / tiku(题库自动答题暂存) / ai(AI答题暂存)")
     parser.add_argument("--headful", action="store_true", help="显示浏览器窗口（用于直观排查卡顿或界面验证）")
     parser.add_argument("--no-update", action="store_true", help="跳过自动检测更新")
     args = parser.parse_args()
@@ -1754,26 +1801,29 @@ def main():
     # 询问测验处理模式（若未在参数中指定）
     if not args.quiz_mode:
         saved_mode = cfg.get("quiz_mode", "skip")
-        print("\n2. 请选择单元测试/章节测验处理方式:")
-        print("   [1] 仅看视频，安全跳过测验（默认最稳妥）")
-        print("   [2] 公共题库自动答题并【自动暂存草稿】（推荐，零门槛免配置开箱即用）")
-        print("   [3] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
-        default_disp = '1' if saved_mode == 'skip' else ('2' if saved_mode == 'tiku' else '3')
-        try:
-            choice = input(f"请输入选项 [1/2/3] (直接回车默认 [{default_disp}]): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            choice = ""
-        if choice == "2":
-            cfg["quiz_mode"] = "tiku"
-        elif choice == "3":
-            cfg["quiz_mode"] = "ai"
-            if not cfg["ai_config"].get("api_key"):
-                user_key = input("请输入你的 AI API Key (直接回车可稍后填): ").strip()
-                if user_key:
-                    cfg["ai_config"]["api_key"] = user_key
-        elif choice == "1":
-            cfg["quiz_mode"] = "skip"
-        save_config(cfg)
+        if sys.stdin.isatty():
+            print("\n2. 请选择单元测试/章节测验处理方式:")
+            print("   [1] 仅看视频，安全跳过测验（默认最稳妥）")
+            print("   [2] 公共题库自动答题并【自动暂存草稿】（推荐，零门槛免配置开箱即用）")
+            print("   [3] AI 智能辅助答题并【自动暂存草稿】（可在 config.json 配置 Key）")
+            default_disp = '1' if saved_mode == 'skip' else ('2' if saved_mode == 'tiku' else '3')
+            try:
+                choice = input(f"请输入选项 [1/2/3] (直接回车默认 [{default_disp}]): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            if choice == "2":
+                cfg["quiz_mode"] = "tiku"
+            elif choice == "3":
+                cfg["quiz_mode"] = "ai"
+                if not cfg["ai_config"].get("api_key"):
+                    user_key = input("请输入你的 AI API Key (直接回车可稍后填): ").strip()
+                    if user_key:
+                        cfg["ai_config"]["api_key"] = user_key
+            elif choice == "1":
+                cfg["quiz_mode"] = "skip"
+            save_config(cfg)
+        else:
+            cfg["quiz_mode"] = saved_mode
     else:
         cfg["quiz_mode"] = args.quiz_mode
 
@@ -1781,20 +1831,23 @@ def main():
     if not args.headful:
         saved_headless = cfg.get("headless", True)
         default_hl = "1" if saved_headless else "2"
-        print("\n3. 请选择浏览器运行显示方式:")
-        print("   [1] 后台静默运行（无头模式，省 CPU/内存，挂机推荐）")
-        print("   [2] 弹出浏览器窗口（图形界面，便于实时观察画面）")
-        try:
-            choice_hl = input(f"请输入选项 [1/2] (直接回车默认 [{default_hl}]): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            choice_hl = ""
-        if choice_hl == "2":
-            cfg["headless"] = False
-        elif choice_hl == "1":
-            cfg["headless"] = True
+        if sys.stdin.isatty():
+            print("\n3. 请选择浏览器运行显示方式:")
+            print("   [1] 后台静默运行（无头模式，省 CPU/内存，挂机推荐）")
+            print("   [2] 弹出浏览器窗口（图形界面，便于实时观察画面）")
+            try:
+                choice_hl = input(f"请输入选项 [1/2] (直接回车默认 [{default_hl}]): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice_hl = ""
+            if choice_hl == "2":
+                cfg["headless"] = False
+            elif choice_hl == "1":
+                cfg["headless"] = True
+            else:
+                cfg["headless"] = saved_headless
+            save_config(cfg)
         else:
             cfg["headless"] = saved_headless
-        save_config(cfg)
     else:
         cfg["headless"] = False
 
