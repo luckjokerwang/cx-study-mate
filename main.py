@@ -169,10 +169,23 @@ def notify_user(title, message, is_popup=False, block=False):
         threading.Thread(target=_dispatch, daemon=False).start()
 
 
+def _deep_merge(base, override):
+    """递归合并配置，保证新增的嵌套默认项不会因旧 config.json 而丢失"""
+    result = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
 def load_config():
     default_cfg = {
         "auto_update": True,
         "quiz_mode": "skip",
+        "auto_submit": False,
+        "min_accuracy": 0.8,
+        "playback_rate": 1.0,
         "ai_config": {
             "api_key": "",
             "base_url": "https://api.deepseek.com/v1",
@@ -180,7 +193,10 @@ def load_config():
         },
         "tiku_config": {
             "api_url": "",
-            "token": ""
+            "token": "",
+            "thtoken": "",
+            "yztoken": "",
+            "enncy_token": ""
         },
         "notification": {
             "enabled": True,
@@ -192,7 +208,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return {**default_cfg, **json.load(f)}
+                return _deep_merge(default_cfg, json.load(f))
         except Exception:
             pass
     return default_cfg
@@ -1459,6 +1475,86 @@ def extract_chapters_from_page(page):
         return list;
     }""")
 
+def is_job_finished(cards_frame, idx):
+    """判断卡片区第 idx 个任务点是否已完成（兼容图标 aria-label 与 finished 样式）"""
+    if not cards_frame:
+        return False
+    try:
+        return bool(cards_frame.evaluate(f"""() => {{
+            const cts = document.querySelectorAll('.ans-attach-ct');
+            if (!cts[{idx}]) return false;
+            const ct = cts[{idx}];
+            const icon = ct.querySelector('.ans-job-icon');
+            if (icon && (icon.getAttribute('aria-label') || '').includes('已完成')) return true;
+            if (icon && icon.closest('.ans-job-finished') !== null) return true;
+            if (ct.classList.contains('ans-job-finished')) return true;
+            return false;
+        }}"""))
+    except Exception:
+        return False
+
+def play_audio_frame(page, af, audio_idx, total_audios):
+    """静音播放音频任务点，等待播放结束或任务点达标"""
+    log(f"   --> [音频 {audio_idx}/{total_audios}] 开始静音播放...")
+    deadline = time.time() + 45 * 60
+    last_report = 0.0
+    while time.time() < deadline:
+        state = None
+        try:
+            state = af.evaluate("""() => {
+                const a = document.getElementById('audio_html5_api') || document.querySelector('audio');
+                if (!a) return null;
+                a.muted = true;
+                a.volume = 0;
+                if (a.paused && !a.ended) { try { a.play(); } catch(e){} }
+                const finished = (typeof window.isUnFinishJob === 'function') ? !window.isUnFinishJob() : false;
+                return {
+                    current: Number(a.currentTime) || 0,
+                    duration: Number(a.duration) || 0,
+                    ended: Boolean(a.ended),
+                    finished
+                };
+            }""")
+        except Exception:
+            state = None
+
+        if state:
+            if state["ended"] or state["finished"]:
+                return True
+            if state["duration"] > 0 and state["current"] >= state["duration"] - 1.5:
+                return True
+            now = time.time()
+            if now - last_report >= 60:
+                log(f"   [音频 {audio_idx}/{total_audios}] 已播 {int(state['current'])}/{int(state['duration'])} 秒")
+                last_report = now
+        page.wait_for_timeout(2000)
+    log(f"   ⚠️ [音频 {audio_idx}/{total_audios}] 播放超时，已跳过。")
+    return False
+
+def read_document_frame(page, df, doc_idx, total_docs):
+    """滚动 PDF/文档任务点，触发阅读进度上报"""
+    log(f"   --> [文档 {doc_idx}/{total_docs}] 正在翻页阅读...")
+    for _ in range(3):
+        try:
+            df.evaluate("""() => {
+                const scrollWindow = (w) => {
+                    try {
+                        if (!w || !w.document) return;
+                        w.scrollTo(0, w.document.body ? w.document.body.scrollHeight : 0);
+                    } catch (e) {}
+                };
+                scrollWindow(window);
+                const pan = document.getElementById('panView');
+                if (pan && pan.contentWindow) scrollWindow(pan.contentWindow);
+                document.querySelectorAll('iframe').forEach((f) => {
+                    try { if (f.contentWindow) scrollWindow(f.contentWindow); } catch (e) {}
+                });
+            }""")
+        except Exception:
+            pass
+        page.wait_for_timeout(2500)
+    return True
+
 def process_current_tab_tasks(page, cfg):
     """处理当前卡片/标签下的所有任务点（包含视频与章节测验）"""
     if page.is_closed():
@@ -1474,22 +1570,7 @@ def process_current_tab_tasks(page, cfg):
     if video_frames:
         log(f"   发现 {len(video_frames)} 个视频任务，准备播放...")
         for idx, vf in enumerate(video_frames):
-            is_done = False
-            if cards_frame:
-                try:
-                    is_done = cards_frame.evaluate(f"""() => {{
-                        const cts = document.querySelectorAll('.ans-attach-ct');
-                        if (cts[{idx}]) {{
-                            const icon = cts[{idx}].querySelector('.ans-job-icon');
-                            if (icon && (icon.getAttribute('aria-label') || '').includes('已完成')) return true;
-                            if (icon && icon.closest('.ans-job-finished') !== null) return true;
-                            if (cts[{idx}].classList.contains('ans-job-finished')) return true;
-                        }}
-                        return false;
-                    }}""")
-                except Exception:
-                    pass
-
+            is_done = is_job_finished(cards_frame, idx)
             if not is_done:
                 try:
                     is_done = vf.evaluate("""() => {
@@ -1510,7 +1591,44 @@ def process_current_tab_tasks(page, cfg):
 
     if page.is_closed():
         return
-    # 2. 章节测验/作业处理
+    # 2. 音频任务
+    audio_frames = [f for f in page.frames if '/ananas/modules/audio/' in f.url]
+    if audio_frames:
+        audio_frames = [f for f in audio_frames if f.parent_frame not in audio_frames]
+        log(f"   发现 {len(audio_frames)} 个音频任务，准备播放...")
+        for idx, af in enumerate(audio_frames):
+            if is_job_finished(cards_frame, idx):
+                log(f"   --> [音频 {idx + 1}/{len(audio_frames)}] 此前已完成，跳过。")
+                continue
+            try:
+                if play_audio_frame(page, af, idx + 1, len(audio_frames)):
+                    log(f"   [打卡成功] 音频 {idx + 1} 学习完毕！")
+            except Exception as e:
+                log(f"   ⚠️ 音频任务处理异常: {e}")
+
+    if page.is_closed():
+        return
+    # 3. PDF/文档任务
+    doc_frames = [
+        f for f in page.frames
+        if any(k in f.url for k in ['/ananas/modules/pdf/', '/ananas/modules/doc/', '/ananas/modules/document/'])
+    ]
+    if doc_frames:
+        doc_frames = [f for f in doc_frames if f.parent_frame not in doc_frames]
+        log(f"   发现 {len(doc_frames)} 个文档任务，准备阅读...")
+        for idx, df in enumerate(doc_frames):
+            if is_job_finished(cards_frame, idx):
+                log(f"   --> [文档 {idx + 1}/{len(doc_frames)}] 此前已完成，跳过。")
+                continue
+            try:
+                read_document_frame(page, df, idx + 1, len(doc_frames))
+                log(f"   [打卡成功] 文档 {idx + 1} 阅读完毕！")
+            except Exception as e:
+                log(f"   ⚠️ 文档任务处理异常: {e}")
+
+    if page.is_closed():
+        return
+    # 4. 章节测验/作业处理
     quiz_frames = [
         f for f in page.frames
         if any(k in f.url for k in ['doHomeWorkNew', 'dowork', 'selectWorkQuestion', 'work/index.html', 'work/question'])
